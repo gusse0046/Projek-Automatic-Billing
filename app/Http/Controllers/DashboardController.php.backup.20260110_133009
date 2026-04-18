@@ -1,0 +1,3705 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Mail;
+use App\Models\DocumentSetting;
+use App\Models\DocumentUpload;
+use App\Models\BillingStatus;
+use App\Models\SapDataStorage;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Schema;
+
+class DashboardController extends Controller
+{
+    private $billingApiUrl = 'http://127.0.0.1:50';
+    private $billingData = null;
+
+    /**
+     * Get location based on delivery order prefix
+     */
+    private function getLocationFromDeliveryOrder($deliveryOrder)
+    {
+        $prefix = substr($deliveryOrder, 0, 3);
+        
+        switch ($prefix) {
+            case '201':
+            case '211':  // Surabaya variant (untuk billing 315)
+                return 'Surabaya';
+                
+            case '202':
+            case '212':  // Semarang variant (jika ada)
+                return 'Semarang';
+                
+            default:
+                \Log::warning("Unknown DO prefix: {$prefix} for delivery: {$deliveryOrder}");
+                return 'Unknown';
+        }
+    }
+
+    /**
+     * Check if delivery qualifies as LOCAL (Billing Doc 315 or 316)
+     */
+    private function isLocalDelivery($billingDocument)
+    {
+        $prefix = substr($billingDocument, 0, 3);
+        return in_array($prefix, ['315', '316']);
+    }
+
+    /**
+     * Group data by location
+     */
+    private function groupDataByLocation($groupedData)
+    {
+        $locationGroups = [
+            'Surabaya' => [],
+            'Semarang' => [],
+            'Unknown' => []
+        ];
+        
+        foreach ($groupedData as $key => $group) {
+            $location = $this->getLocationFromDeliveryOrder($group['delivery']);
+            $locationGroups[$location][$key] = $group;
+        }
+        
+        return $locationGroups;
+    }
+
+    /**
+     * Get SAP storage information
+     */
+    public function getStorageInfo()
+    {
+        try {
+            $storageStats = SapDataStorage::getStorageStats();
+            $storageInfo = SapDataStorage::getStorageInfo();
+            
+            return response()->json([
+                'success' => true,
+                'storage_stats' => $storageStats,
+                'storage_info' => $storageInfo,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Error getting storage info: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error getting storage info: ' . $e->getMessage(),
+                'timestamp' => now()->toDateTimeString()
+            ], 500);
+        }
+    }
+
+    /**
+     * Manual SAP sync
+     */
+    public function syncSapNow(Request $request)
+    {
+        try {
+            $forceSync = $request->get('force', false);
+            $endpoint = $request->get('endpoint', 'fast');
+            
+            Log::info('Manual SAP sync requested', [
+                'force' => $forceSync,
+                'endpoint' => $endpoint,
+                'user' => Auth::user()->name ?? 'Unknown'
+            ]);
+            
+            $startTime = microtime(true);
+            
+            $billingData = $this->fetchBillingDataWithFallback($endpoint);
+            
+            if ($billingData === null || !is_array($billingData)) {
+                throw new \Exception('Failed to fetch data from SAP');
+            }
+            
+            $fetchDuration = microtime(true) - $startTime;
+            
+            $stored = SapDataStorage::storeBillingData(
+                $billingData, 
+                $endpoint, 
+                $fetchDuration
+            );
+            
+            if (!$stored) {
+                throw new \Exception('Failed to store data to database');
+            }
+            
+            Log::info('Manual SAP sync completed successfully', [
+                'record_count' => count($billingData),
+                'endpoint' => $endpoint,
+                'duration' => $fetchDuration,
+                'storage_id' => $stored->id ?? 'unknown'
+            ]);
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'SAP data synced successfully',
+                'record_count' => count($billingData),
+                'endpoint_used' => $endpoint,
+                'fetch_duration' => round($fetchDuration, 2),
+                'storage_id' => $stored->id ?? null,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Manual SAP sync failed: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'SAP sync failed: ' . $e->getMessage(),
+                'timestamp' => now()->toDateTimeString()
+            ], 500);
+        }
+    }
+
+    /**
+     * Admin Finance Dashboard dengan pagination variables dan location filter
+     */
+public function adminFinance(Request $request)
+{
+    try {
+        $startTime = microtime(true);
+        $locationFilter = $request->get('location', 'all');
+        $selectedBuyer = $request->get('buyer');
+        
+        // ✅ STEP 1: Jika location = 'all', tampilkan OVERVIEW
+        if ($locationFilter === 'all') {
+            $billingData = $this->getBillingDataWithDatabaseCaching();
+            if (!$billingData) {
+                $billingData = $this->fetchBillingDataWithFallback('fast');
+            }
+            
+            if ($billingData && is_array($billingData)) {
+                $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                
+              // ✅ Add location to each group
+foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+                
+                // ✅ HITUNG TOTAL PER CURRENCY PER LOCATION
+                $buyerFinancialSummary = $this->calculateBuyerFinancialSummary($allGroupedData);
+                
+                return view('dashboard.admin-finance', [
+                    'user' => Auth::user(),
+                    'sapUsername' => session('sap_username', 'Unknown'),
+                    'userType' => 'Admin Finance',
+                    'locationFilter' => 'all',
+                    'selectedBuyer' => null,
+                    'locationStats' => $this->getLocationStats(),
+                    'buyerNotifications' => $this->getBuyerNotificationCounts($allGroupedData),
+                    'buyerFinancialSummary' => $buyerFinancialSummary, // ✅ NEW
+                    'showOverview' => true // ✅ NEW
+                ]);
+            }
+        }
+            
+            // STEP 2: Sudah pilih location tapi belum pilih buyer
+            if (!$selectedBuyer || empty($selectedBuyer)) {
+                $billingData = $this->getBillingDataWithDatabaseCaching();
+                if (!$billingData) {
+                    $billingData = $this->fetchBillingDataWithFallback('fast');
+                }
+                
+                $filteredBuyersByLocation = [];
+                $allGroupedData = [];
+                
+                if ($billingData && is_array($billingData)) {
+                    $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                    
+                  foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key] = array_merge($group, [
+        'location' => $this->getLocationFromDeliveryOrder($group['delivery']),
+        'is_local' => $this->isLocalDelivery($group['billing_document'] ?? '')
+    ]);
+}
+
+// ✅ ADD LOGGING HERE
+Log::info("=== AFTER LOCATION ASSIGNMENT ===");
+$ethanData = array_filter($allGroupedData, function($g) {
+    return stripos($g['customer_name'], 'ETHAN ALLEN') !== false;
+});
+Log::info("Ethan Allen count: " . count($ethanData));
+foreach($ethanData as $key => $data) {
+    Log::info("Key: {$key} | Delivery: {$data['delivery']} | Billing: {$data['billing_document']}");
+}
+                    
+                    // ✅ FILTER BERDASARKAN LOCATION (Surabaya, Semarang, atau LOCAL)
+                    $filteredByLocation = array_filter($allGroupedData, function($group) use ($locationFilter) {
+                        $deliveryPrefix = substr($group['delivery'], 0, 3);
+                        
+                        // Jika filter LOCAL, cek billing doc 315/316 dan DO 211/212
+                        if (strtolower($locationFilter) === 'local') {
+                            return $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        }
+                        
+                        // ✅ UNTUK SURABAYA/SEMARANG: EXCLUDE data yang is_local = true
+                        // Surabaya dan Semarang hanya menampilkan data yang BUKAN LOCAL
+                        $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                        $isNotLocal = !$group['is_local']; // Exclude LOCAL data
+                        
+                        return $matchLocation && $isNotLocal;
+                    });
+                    
+                    $buyersGrouped = collect($filteredByLocation)->groupBy('customer_name');
+                    foreach ($buyersGrouped as $customerName => $deliveries) {
+                        $billingDocs = $deliveries->pluck('billing_document')
+                                                  ->filter(function($doc) {
+                                                      return !empty($doc) && $doc !== null;
+                                                  })
+                                                  ->unique()
+                                                  ->values()
+                                                  ->toArray();
+                        
+                        $filteredBuyersByLocation[] = [
+                            'name' => $customerName,
+                            'slug' => Str::slug($customerName),
+                            'delivery_count' => $deliveries->count(),
+                            'total_value' => $deliveries->sum('total_net_value'),
+                            'billing_documents' => $billingDocs
+                        ];
+                    }
+                    
+                    usort($filteredBuyersByLocation, function($a, $b) {
+                        return strcmp($a['name'], $b['name']);
+                    });
+                }
+                
+                return view('dashboard.admin-finance', [
+                    'user' => Auth::user(),
+                    'sapUsername' => session('sap_username', 'Unknown'),
+                    'userType' => 'Admin Finance',
+                    'locationFilter' => $locationFilter,
+                    'selectedBuyer' => null,
+                    'filteredBuyersByLocation' => $filteredBuyersByLocation,
+                    'locationStats' => $this->getLocationStats(),
+                    'buyerNotifications' => $this->getBuyerNotificationCounts($allGroupedData),
+                ]);
+            }
+            
+            // STEP 3: Sudah pilih buyer - load semua data finance
+            $billingData = $this->getBillingDataWithDatabaseCaching();
+            if (!$billingData) {
+                $billingData = $this->fetchBillingDataWithFallback('fast');
+            }
+
+            if ($billingData && is_array($billingData)) {
+                $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                
+          foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+    $allGroupedData[$key]['is_local'] = $this->isLocalDelivery($group['billing_document'] ?? '');
+}
+unset($key, $group);
+                
+               $finalGroupedData = array_filter($allGroupedData, function($group) use ($selectedBuyer, $locationFilter) {
+    
+    $customerName = trim($group['customer_name'] ?? '');
+    $normalizedCustomer = preg_replace('/\s+/', ' ', $customerName);
+    $buyerSlug = Str::slug($normalizedCustomer);
+    
+    $groupLocation = trim($group['location'] ?? '');
+    $billingDoc = $group['billing_document'] ?? '';
+    
+    // ✅ DEBUG untuk semua billing doc 312*
+    if (substr($billingDoc, 0, 3) === '312') {
+        Log::info("FILTERING BILLING 312", [
+            'delivery' => $group['delivery'],
+            'billing_doc' => $billingDoc,
+            'customer' => $customerName,
+            'buyer_slug' => $buyerSlug,
+            'selected_buyer' => $selectedBuyer,
+            'location' => $groupLocation,
+            'filter_location' => $locationFilter,
+            'is_local' => $group['is_local'],
+        ]);
+    }
+    
+    $matchBuyer = ($buyerSlug === $selectedBuyer);
+    
+    if (!$matchBuyer) {
+        if (substr($billingDoc, 0, 3) === '312') {
+            Log::info("BILLING 312 FILTERED OUT - Buyer not match");
+        }
+        return false;
+    }
+    
+    $matchLocation = false;
+    
+    if (strtolower($locationFilter) === 'local') {
+        $deliveryPrefix = substr($group['delivery'], 0, 3);
+        $matchLocation = $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+    } else {
+        $isLocationMatch = (strtolower($groupLocation) === strtolower($locationFilter));
+        $isNotLocal = !($group['is_local'] ?? false);
+        
+        if (substr($billingDoc, 0, 3) === '312') {
+            Log::info("BILLING 312 Location Check", [
+                'location_match' => $isLocationMatch,
+                'is_local' => $group['is_local'],
+                'is_not_local' => $isNotLocal
+            ]);
+        }
+        
+        if ($groupLocation === 'Unknown') {
+            $deliveryPrefix = substr($group['delivery'], 0, 3);
+            if (in_array($deliveryPrefix, ['202', '212']) && strtolower($locationFilter) === 'semarang') {
+                $matchLocation = true;
+            } elseif (in_array($deliveryPrefix, ['201', '211']) && strtolower($locationFilter) === 'surabaya') {
+                $matchLocation = true;
+            }
+        } else {
+            $matchLocation = $isLocationMatch && $isNotLocal;
+        }
+    }
+    
+    if (substr($billingDoc, 0, 3) === '312') {
+        Log::info("BILLING 312 FINAL", [
+            'match_location' => $matchLocation,
+            'match_buyer' => $matchBuyer,
+            'will_pass' => ($matchLocation && $matchBuyer)
+        ]);
+    }
+    
+    return $matchLocation && $matchBuyer;
+});
+
+Log::info("=== AFTER FILTER ===");
+Log::info("Total filtered data: " . count($finalGroupedData));
+
+$ethanFiltered = array_filter($finalGroupedData, function($g) {
+    return stripos($g['customer_name'], 'ETHAN ALLEN') !== false;
+});
+
+Log::info("Ethan Allen after filter: " . count($ethanFiltered));
+Log::info("Ethan Allen deliveries:", array_column($ethanFiltered, 'delivery'));
+
+$billing312Filtered = array_filter($finalGroupedData, function($g) {
+    return substr($g['billing_document'] ?? '', 0, 3) === '312';
+});
+
+Log::info("Billing 312* after filter: " . count($billing312Filtered));
+foreach($billing312Filtered as $b) {
+    Log::info("  " . $b['delivery'] . " | " . $b['billing_document']);
+}
+                
+               $progressData = [];
+foreach ($finalGroupedData as $key => $group) {
+    try {
+        // ✅ Extract billing document dari $group
+        $billingDoc = $group['billing_document'] ?? null;
+        
+        Log::info("Getting progress for {$group['delivery']}", [
+            'key' => $key,
+            'customer' => $group['customer_name'],
+            'billing_document' => $billingDoc // ✅ NEW
+        ]);
+        
+        // ✅ FIX: Clone $group agar tidak ter-mutate
+        $deliveryOrder = $group['delivery'];
+        $customerName = $group['customer_name'];
+        
+        // ✅ PASS BILLING DOCUMENT to getDetailedProgress
+        $progress = BillingStatus::getDetailedProgress(
+            $deliveryOrder, 
+            $customerName,
+            $billingDoc // ✅ NEW PARAMETER
+        );
+        
+        $progressData[$key] = $progress;
+        
+        Log::info("✅ Progress calculated for key: {$key}", [
+            'delivery' => $deliveryOrder,
+            'billing' => $billingDoc,
+            'overall_progress' => $progress['overall_progress_percentage'] ?? 0,
+            'finance' => ($progress['finance_uploaded'] ?? 0) . '/' . ($progress['finance_total'] ?? 3),
+            'exim' => ($progress['exim_uploaded'] ?? 0) . '/' . ($progress['exim_total'] ?? 0)
+        ]);
+        
+    } catch (\Exception $e) {
+        Log::error("Failed to get progress for {$group['delivery']}: " . $e->getMessage());
+        $progressData[$key] = [
+            'status' => 'outstanding',
+            'can_be_sent' => false,
+            'is_sent' => false,
+            'overall_progress_percentage' => 0,
+            'finance_uploaded' => 0,
+            'finance_total' => 3,
+            'exim_uploaded' => 0,
+            'exim_total' => 0,
+        ];
+    }
+}
+                
+Log::info("Total progress data collected: " . count($progressData));
+                
+                $allTeamDocuments = $this->buildAllTeamDocuments($finalGroupedData);
+                
+                $filteredByLocation = array_filter($allGroupedData, function($group) use ($locationFilter) {
+                    return strtolower($group['location']) === strtolower($locationFilter);
+                });
+                
+                $buyersGrouped = collect($filteredByLocation)->groupBy('customer_name');
+                $filteredBuyersByLocation = [];
+                foreach ($buyersGrouped as $customerName => $deliveries) {
+                    $billingDocs = $deliveries->pluck('billing_document')
+                                              ->filter(function($doc) {
+                                                  return !empty($doc) && $doc !== null;
+                                              })
+                                              ->unique()
+                                              ->values()
+                                              ->toArray();
+                    
+                    $filteredBuyersByLocation[] = [
+                        'name' => $customerName,
+                        'slug' => Str::slug($customerName),
+                        'delivery_count' => $deliveries->count(),
+                        'total_value' => $deliveries->sum('total_net_value'),
+                        'billing_documents' => $billingDocs
+                    ];
+                }
+                
+                // ✅ ADD THIS
+Log::info("=== DATA PASSED TO VIEW ===");
+Log::info("groupedData count: " . count($finalGroupedData));
+Log::info("groupedData keys: " . json_encode(array_keys($finalGroupedData)));
+Log::info("groupedData deliveries: " . json_encode(array_column($finalGroupedData, 'delivery')));
+
+                return view('dashboard.admin-finance', [
+                    'user' => Auth::user(),
+                    'sapUsername' => session('sap_username', 'Unknown'),
+                    'userType' => 'Admin Finance',
+                    'groupedData' => $finalGroupedData,
+                    'allTeamDocuments' => $allTeamDocuments,
+                    'progressData' => $progressData,
+                    'locationFilter' => $locationFilter,
+                    'selectedBuyer' => $selectedBuyer,
+                    'filteredBuyersByLocation' => $filteredBuyersByLocation,
+                    'locationStats' => $this->getLocationStats(),
+                    'buyerNotifications' => $this->getBuyerNotificationCounts($allGroupedData),
+                ]);
+            }
+
+            // Fallback error
+            return view('dashboard.admin-finance', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username', 'Unknown'),
+                'userType' => 'Admin Finance',
+                'locationFilter' => 'all',
+                'error' => 'No data available',
+                'buyerNotifications' => [],
+            ]);
+            
+    } catch (\Exception $e) {
+        Log::error('Admin Finance Dashboard Error: ' . $e->getMessage());
+        
+        return view('dashboard.admin-finance', [
+            'user' => Auth::user(),
+            'sapUsername' => session('sap_username', 'Unknown'),
+            'userType' => 'Admin Finance',
+            'locationFilter' => 'all',
+            'error' => 'Dashboard error: ' . $e->getMessage(),
+            'buyerNotifications' => [],
+        ]);
+    }
+}
+
+    private function getLocationStats()
+    {
+        try {
+            $billingData = $this->getBillingDataWithDatabaseCaching();
+            if (!$billingData) return ['surabaya' => 0, 'semarang' => 0, 'local' => 0];
+            
+            $groupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+            $surabayaCount = 0;
+            $semarangCount = 0;
+            $localCount = 0;
+            
+            foreach ($groupedData as &$group) {
+                $group['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+                $group['is_local'] = $this->isLocalDelivery($group['billing_document'] ?? '');
+                
+                // Count LOCAL: Billing Doc 315/316 AND DO 211/212
+                $deliveryPrefix = substr($group['delivery'], 0, 3);
+                if ($group['is_local'] && in_array($deliveryPrefix, ['211', '212'])) {
+                    $localCount++;
+                } else {
+                    // ✅ HANYA COUNT NON-LOCAL untuk Surabaya dan Semarang
+                    if ($group['location'] === 'Surabaya') {
+                        $surabayaCount++;
+                    } elseif ($group['location'] === 'Semarang') {
+                        $semarangCount++;
+                    }
+                }
+            }
+            
+            return [
+                'surabaya' => $surabayaCount,
+                'semarang' => $semarangCount,
+                'local' => $localCount
+            ];
+        } catch (\Exception $e) {
+            return ['surabaya' => 0, 'semarang' => 0, 'local' => 0];
+        }
+    }
+
+    private function buildAllTeamDocuments($groupedData)
+    {
+        $allTeamDocuments = [];
+        
+        foreach ($groupedData as $key => $group) {
+            $delivery = $group['delivery'];
+            $customer = $group['customer_name'];
+            $billingDoc = $group['billing_document'] ?? null; // ✅ Get billing document
+            
+            try {
+                // ✅ CRITICAL FIX: Query berdasarkan billing_document jika ada
+                $query = DocumentUpload::where('delivery_order', $delivery)
+                                       ->where('customer_name', $customer);
+                
+                // ✅ Filter by billing_document jika column exists dan billing berbeda
+                if ($billingDoc && $billingDoc !== $delivery) {
+                    $query->where(function($q) use ($billingDoc, $delivery) {
+                        $q->where('billing_document', $billingDoc)
+                          ->orWhereNull('billing_document')
+                          ->orWhere('billing_document', '')
+                          ->orWhere('billing_document', $delivery); // Legacy: billing = delivery
+                    });
+                }
+                
+                $allUploads = $query->get();
+                
+                Log::debug('Document query for billing separation', [
+                    'delivery' => $delivery,
+                    'billing_document' => $billingDoc,
+                    'documents_found' => $allUploads->count()
+                ]);
+                
+                $financeDocuments = [];
+                $eximDocuments = [];
+                $logisticDocuments = [];
+                
+                foreach ($allUploads as $upload) {
+                    $docInfo = [
+                        'id' => $upload->id,
+                        'file_name' => $upload->file_name,
+                        'file_type' => $upload->file_type,
+                        'document_type' => $upload->document_type,
+                        'uploaded_by' => $upload->uploaded_by ?? 'System',
+                        'uploaded_at' => $upload->uploaded_at
+                    ];
+                    
+                    if (in_array($upload->document_type, BillingStatus::FINANCE_REQUIRED_DOCUMENTS)) {
+                        // Finance documents
+                        $financeDocuments[$upload->document_type] = $docInfo;
+                    } elseif (in_array($upload->document_type, ['CARB','CONTAINER_LOAD','CONTAINER_CHEKLIST'])) {
+                        // Logistic documents - simpan di logistic_documents
+                        if (!isset($logisticDocuments[$upload->document_type])) {
+                            $logisticDocuments[$upload->document_type] = [];
+                        }
+                        $logisticDocuments[$upload->document_type][] = $docInfo;
+                        
+                        // ✅ CRITICAL FIX: Dokumen logistic JUGA harus masuk ke exim_documents
+                        // Karena alur: Logistic → Exim → Finance
+                        // Semua yang ada di Exim harus tampil di Finance juga
+                        if (!isset($eximDocuments[$upload->document_type])) {
+                            $eximDocuments[$upload->document_type] = [];
+                        }
+                        $eximDocuments[$upload->document_type][] = $docInfo;
+                    } else {
+                        // Exim documents (BILL OF LADING, dll)
+                        if (!isset($eximDocuments[$upload->document_type])) {
+                            $eximDocuments[$upload->document_type] = [];
+                        }
+                        $eximDocuments[$upload->document_type][] = $docInfo;
+                    }
+                }
+                
+                $financeMissing = array_diff(
+                    BillingStatus::FINANCE_REQUIRED_DOCUMENTS,
+                    array_keys($financeDocuments)
+                );
+                
+                $allTeamDocuments[$key] = [
+                    'finance_documents' => $financeDocuments,
+                    'finance_missing' => array_values($financeMissing),
+                    'exim_documents' => $eximDocuments,
+                    'logistic_documents' => $logisticDocuments
+                ];
+                
+            } catch (\Exception $e) {
+                Log::error("Error building team documents for {$delivery}: " . $e->getMessage());
+                $allTeamDocuments[$key] = [
+                    'finance_documents' => [],
+                    'finance_missing' => BillingStatus::FINANCE_REQUIRED_DOCUMENTS,
+                    'exim_documents' => [],
+                    'logistic_documents' => []
+                ];
+            }
+        }
+        
+        return $allTeamDocuments;
+    }
+
+/**
+ * Get buyer notification counts - IMPROVED & ACCURATE
+ * Method ini dipanggil dari admin-finance blade dan API endpoint
+ */
+private function getBuyerNotificationCounts($groupedData)
+{
+    $notificationCounts = [];
+    
+    foreach ($groupedData as $key => $group) {
+        $customerName = $group['customer_name'];
+        $deliveryOrder = $group['delivery'];
+        
+        if (!isset($notificationCounts[$customerName])) {
+            $notificationCounts[$customerName] = [
+                'completed_count' => 0,
+                'billed_count' => 0,
+                'total_deliveries' => 0
+            ];
+        }
+        
+        try {
+            // ✅ FIX: Ambil billing_document dari $group
+            $billingDocument = $group['billing_document'] ?? null;
+            
+            // ✅ Pass billing document dari group data
+            $progress = BillingStatus::getDetailedProgress(
+                $deliveryOrder, 
+                $customerName,
+                $billingDocument  // ✅ BENAR: Dari $group, bukan variable yang tidak ada
+            );
+            
+            $overallProgress = $progress['overall_progress_percentage'] ?? 0;
+            $status = $progress['status'] ?? 'outstanding';
+            
+            if ($overallProgress >= 100 && $status !== 'sent') {
+                $notificationCounts[$customerName]['completed_count']++;
+            }
+            
+            if ($status === 'sent') {
+                $notificationCounts[$customerName]['billed_count']++;
+            }
+            
+            $notificationCounts[$customerName]['total_deliveries']++;
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to count notifications for {$deliveryOrder}: " . $e->getMessage());
+            $notificationCounts[$customerName]['total_deliveries']++;
+        }
+    }
+    
+    return $notificationCounts;
+}
+
+    /**
+     * API endpoint untuk get notification counts (AJAX)
+     */
+    public function getBuyerNotifications(Request $request)
+    {
+        try {
+            $location = $request->get('location', 'all');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching();
+            if (!$billingData) {
+                $billingData = $this->fetchBillingDataWithFallback('fast');
+            }
+            
+            if (!$billingData || !is_array($billingData)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No billing data available'
+                ]);
+            }
+            
+            $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+        foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+            
+            if ($location !== 'all') {
+                $allGroupedData = array_filter($allGroupedData, function($group) use ($location) {
+                    return strtolower($group['location']) === strtolower($location);
+                });
+            }
+            
+            $notificationCounts = $this->getBuyerNotificationCounts($allGroupedData);
+            
+            return response()->json([
+                'success' => true,
+                'notifications' => $notificationCounts,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Error getting buyer notifications: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+ * Get buyer notification counts khusus untuk EXIM Dashboard
+ * Hanya hitung EXIM documents, exclude Finance documents
+ */
+private function getBuyerNotificationCountsForExim($groupedData)
+{
+    $notificationCounts = [];
+    
+    foreach ($groupedData as $key => $group) {
+        $customerName = $group['customer_name'];
+        $deliveryOrder = $group['delivery'];
+        
+        // Initialize counter
+        if (!isset($notificationCounts[$customerName])) {
+            $notificationCounts[$customerName] = [
+                'completed_count' => 0,
+                'billed_count' => 0,
+                'total_deliveries' => 0
+            ];
+        }
+        
+        try {
+            // ✅ GUNAKAN METHOD KHUSUS EXIM (sudah ada di BillingStatus.php)
+            $progress = BillingStatus::getDetailedProgressForExim($deliveryOrder, $customerName);
+            
+            $eximComplete = $progress['exim_complete'] ?? false;
+            
+            // Get billing status
+            $billingStatus = BillingStatus::where('delivery_order', $deliveryOrder)
+                                        ->where('customer_name', $customerName)
+                                        ->first();
+            
+            $status = $billingStatus ? $billingStatus->status : 'outstanding';
+            
+            // Count logic
+            if ($eximComplete && $status !== 'sent') {
+                $notificationCounts[$customerName]['completed_count']++;
+            }
+            
+            if ($status === 'sent') {
+                $notificationCounts[$customerName]['billed_count']++;
+            }
+            
+            $notificationCounts[$customerName]['total_deliveries']++;
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to count EXIM notifications: " . $e->getMessage());
+            $notificationCounts[$customerName]['total_deliveries']++;
+        }
+    }
+    
+    return $notificationCounts;
+}
+
+    /**
+     * EXIM Dashboard dengan location filter
+     */
+    public function exim(Request $request)
+    {
+        try {
+            Log::info('=== EXIM DASHBOARD - 3 LEVEL NAVIGATION ===');
+            
+            $startTime = microtime(true);
+            
+            $perPage = (int) $request->get('per_page', 10);
+            $currentPage = (int) $request->get('page', 1);
+            
+            $locationFilter = $request->get('location', 'all');
+            $selectedBuyer = $request->get('buyer');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            $dataSource = 'database_cache';
+            
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            $userType = 'Exim';
+            $groupedData = [];
+            $documentSettings = [];
+            $uploadStatus = [];
+            $loadDuration = 0;
+            $totalRecords = 0;
+            $totalPages = 1;
+            $locationStats = ['surabaya' => 0, 'semarang' => 0, 'local' => 0];
+            $filteredBuyersByLocation = [];
+            
+            if ($billingData !== null && is_array($billingData)) {
+                $groupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                
+                // ✅ ADD is_local flag
+                foreach ($groupedData as $key => $group) {
+    $groupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+    $groupedData[$key]['is_local'] = $this->isLocalDelivery($group['billing_document'] ?? '');
+}
+unset($key, $group);
+                
+                $allGrouped = $groupedData;
+                
+                // ✅ COUNT dengan EXCLUDE LOCAL
+                $surabayaCount = 0;
+                $semarangCount = 0;
+                $localCount = 0;
+                
+                foreach ($allGrouped as $group) {
+                    $deliveryPrefix = substr($group['delivery'], 0, 3);
+                    
+                    if ($group['is_local'] && in_array($deliveryPrefix, ['211', '212'])) {
+                        $localCount++;
+                    } else {
+                        if ($group['location'] === 'Surabaya') $surabayaCount++;
+                        elseif ($group['location'] === 'Semarang') $semarangCount++;
+                    }
+                }
+                
+                $locationStats = [
+                    'surabaya' => $surabayaCount,
+                    'semarang' => $semarangCount,
+                    'local' => $localCount
+                ];
+                
+                if ($locationFilter !== 'all') {
+                    // ✅ FILTER dengan EXCLUDE LOCAL
+                    $filteredByLocation = array_filter($groupedData, function($group) use ($locationFilter) {
+                        $deliveryPrefix = substr($group['delivery'], 0, 3);
+                        
+                        if (strtolower($locationFilter) === 'local') {
+                            return $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        }
+                        
+                        $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                        $isNotLocal = !$group['is_local'];
+                        return $matchLocation && $isNotLocal;
+                    });
+                    
+                    $buyersGrouped = collect($filteredByLocation)->groupBy('customer_name');
+                    foreach ($buyersGrouped as $customerName => $deliveries) {
+                        $filteredBuyersByLocation[] = [
+                            'name' => $customerName,
+                            'slug' => Str::slug($customerName),
+                            'delivery_count' => $deliveries->count(),
+                            'total_value' => $deliveries->sum('total_net_value')
+                        ];
+                    }
+                    
+                    usort($filteredBuyersByLocation, function($a, $b) {
+                        return strcmp($a['name'], $b['name']);
+                    });
+                }
+                
+                if ($selectedBuyer && $locationFilter !== 'all') {
+                    // ✅ FILTER dengan EXCLUDE LOCAL
+                    $groupedData = array_filter($groupedData, function($group) use ($selectedBuyer, $locationFilter) {
+                        $buyerSlug = Str::slug($group['customer_name']);
+                        $matchBuyer = $buyerSlug === $selectedBuyer;
+                        
+                        if (strtolower($locationFilter) === 'local') {
+                            $deliveryPrefix = substr($group['delivery'], 0, 3);
+                            $matchLocation = $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        } else {
+                            $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                            $isNotLocal = !$group['is_local'];
+                            $matchLocation = $matchLocation && $isNotLocal;
+                        }
+                        
+                        return $matchLocation && $matchBuyer;
+                    });
+                } elseif ($locationFilter !== 'all') {
+                    // ✅ FILTER location only dengan EXCLUDE LOCAL
+                    $groupedData = array_filter($groupedData, function($group) use ($locationFilter) {
+                        $deliveryPrefix = substr($group['delivery'], 0, 3);
+                        
+                        if (strtolower($locationFilter) === 'local') {
+                            return $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        }
+                        
+                        $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                        $isNotLocal = !$group['is_local'];
+                        return $matchLocation && $isNotLocal;
+                    });
+                }
+                
+                $documentSettings = $this->getDocumentSettingsForExim($groupedData);
+                $uploadStatus = $this->getUploadStatus($groupedData);
+                
+                $totalRecords = count($groupedData);
+                $totalPages = $totalRecords > 0 ? ceil($totalRecords / $perPage) : 1;
+                
+                $loadDuration = microtime(true) - $startTime;
+                
+                Log::info('EXIM Dashboard loaded', [
+                    'location_filter' => $locationFilter,
+                    'selected_buyer' => $selectedBuyer,
+                    'available_buyers' => count($filteredBuyersByLocation),
+                    'total_deliveries' => count($groupedData)
+                ]);
+            }
+            
+            $allGroupedData = $allGrouped ?? $groupedData;
+            $buyerNotifications = $this->getBuyerNotificationCountsForExim($allGroupedData);
+
+            return view('dashboard.exim', compact(
+                'user', 'sapUsername', 'userType', 'groupedData', 'billingData',
+                'documentSettings', 'uploadStatus', 'dataSource', 'loadDuration',
+                'currentPage', 'perPage', 'totalPages', 'totalRecords',
+                'locationStats', 'locationFilter', 'selectedBuyer', 'filteredBuyersByLocation', 'buyerNotifications'
+            ));
+            
+        } catch (\Exception $e) {
+            Log::error('EXIM Dashboard Error: ' . $e->getMessage());
+            
+            return view('dashboard.exim', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Exim',
+                'groupedData' => [],
+                'billingData' => [],
+                'documentSettings' => [],
+                'uploadStatus' => [],
+                'dataSource' => 'error',
+                'loadDuration' => 0,
+                'currentPage' => 1,
+                'perPage' => 10,
+                'totalPages' => 1,
+                'totalRecords' => 0,
+                'locationStats' => ['surabaya' => 0, 'semarang' => 0],
+                'locationFilter' => 'all',
+                'selectedBuyer' => null,
+                'filteredBuyersByLocation' => [],
+                'buyerNotifications' => [], 
+                'error' => 'System error: ' . $e->getMessage()
+                
+            ]);
+        }
+    }
+
+    /**
+     * Get billing data with database caching
+     */
+    private function getBillingDataWithDatabaseCaching()
+    {
+        try {
+            $cachedData = SapDataStorage::getMainBillingData();
+            
+            if ($cachedData) {
+                Log::info('Using cached billing data from database', [
+                    'record_count' => count($cachedData),
+                    'cache_age_minutes' => SapDataStorage::getCacheAgeMinutes()
+                ]);
+                
+                return $cachedData;
+            }
+            
+            Log::info('No valid cached data found in database');
+            return null;
+            
+        } catch (\Exception $e) {
+            Log::error('Error getting cached billing data: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    public function logistic(Request $request)
+    {
+        try {
+            Log::info('=== LOGISTIC DASHBOARD - 3 LEVEL NAVIGATION ===');
+            
+            $startTime = microtime(true);
+            
+            $perPage = (int) $request->get('per_page', 10);
+            $currentPage = (int) $request->get('page', 1);
+            
+            $locationFilter = $request->get('location', 'all');
+            $selectedBuyer = $request->get('buyer');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            $dataSource = 'database_cache';
+            
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            $userType = 'Logistic';
+            $groupedData = [];
+            $documentSettings = [];
+            $uploadStatus = [];
+            $loadDuration = 0;
+            $totalRecords = 0;
+            $totalPages = 1;
+            $locationStats = ['surabaya' => 0, 'semarang' => 0, 'local' => 0];
+            $filteredBuyersByLocation = [];
+            
+            if ($billingData !== null && is_array($billingData)) {
+                $groupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                
+                // ✅ ADD is_local flag
+                foreach ($groupedData as $key => $group) {
+    $groupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+    $groupedData[$key]['is_local'] = $this->isLocalDelivery($group['billing_document'] ?? '');
+}
+unset($key, $group);
+                
+                $allGrouped = $groupedData;
+                
+                // ✅ COUNT dengan EXCLUDE LOCAL
+                $surabayaCount = 0;
+                $semarangCount = 0;
+                $localCount = 0;
+                
+                foreach ($allGrouped as $group) {
+                    $deliveryPrefix = substr($group['delivery'], 0, 3);
+                    
+                    if ($group['is_local'] && in_array($deliveryPrefix, ['211', '212'])) {
+                        $localCount++;
+                    } else {
+                        if ($group['location'] === 'Surabaya') $surabayaCount++;
+                        elseif ($group['location'] === 'Semarang') $semarangCount++;
+                    }
+                }
+                
+                $locationStats = [
+                    'surabaya' => $surabayaCount,
+                    'semarang' => $semarangCount,
+                    'local' => $localCount
+                ];
+                
+                if ($locationFilter !== 'all') {
+                    // ✅ FILTER dengan EXCLUDE LOCAL
+                    $filteredByLocation = array_filter($groupedData, function($group) use ($locationFilter) {
+                        $deliveryPrefix = substr($group['delivery'], 0, 3);
+                        
+                        if (strtolower($locationFilter) === 'local') {
+                            return $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        }
+                        
+                        $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                        $isNotLocal = !$group['is_local'];
+                        return $matchLocation && $isNotLocal;
+                    });
+                    
+                    $buyersGrouped = collect($filteredByLocation)->groupBy('customer_name');
+                    foreach ($buyersGrouped as $customerName => $deliveries) {
+                        $filteredBuyersByLocation[] = [
+                            'name' => $customerName,
+                            'slug' => Str::slug($customerName),
+                            'delivery_count' => $deliveries->count(),
+                            'total_value' => $deliveries->sum('total_net_value')
+                        ];
+                    }
+                    
+                    usort($filteredBuyersByLocation, function($a, $b) {
+                        return strcmp($a['name'], $b['name']);
+                    });
+                }
+                
+if ($selectedBuyer && $locationFilter !== 'all') {
+    // ✅ FIX: Sama seperti di method exim()
+    $groupedData = array_filter($groupedData, function($group) use ($selectedBuyer, $locationFilter) {
+        $buyerSlug = Str::slug($group['customer_name']);
+        $matchBuyer = $buyerSlug === $selectedBuyer;
+        
+        if (strtolower($locationFilter) === 'local') {
+            $deliveryPrefix = substr($group['delivery'], 0, 3);
+            $matchLocation = $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+        } else {
+            $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+            $isNotLocal = !$group['is_local'];
+            $matchLocation = $matchLocation && $isNotLocal;
+        }
+        
+        return $matchLocation && $matchBuyer;
+    });
+
+                } elseif ($locationFilter !== 'all') {
+                    // ✅ FILTER location only dengan EXCLUDE LOCAL
+                    $groupedData = array_filter($groupedData, function($group) use ($locationFilter) {
+                        $deliveryPrefix = substr($group['delivery'], 0, 3);
+                        
+                        if (strtolower($locationFilter) === 'local') {
+                            return $group['is_local'] && in_array($deliveryPrefix, ['211', '212']);
+                        }
+                        
+                        $matchLocation = strtolower($group['location']) === strtolower($locationFilter);
+                        $isNotLocal = !$group['is_local'];
+                        return $matchLocation && $isNotLocal;
+                    });
+                }
+                
+                $documentSettings = $this->getDocumentSettingsForLogistic($groupedData);
+                $uploadStatus = $this->getUploadStatusForLogistic($groupedData);
+                
+                $totalRecords = count($groupedData);
+                $totalPages = $totalRecords > 0 ? ceil($totalRecords / $perPage) : 1;
+                
+                $loadDuration = microtime(true) - $startTime;
+                
+                Log::info('LOGISTIC Dashboard loaded', [
+                    'location_filter' => $locationFilter,
+                    'selected_buyer' => $selectedBuyer,
+                    'available_buyers' => count($filteredBuyersByLocation),
+                    'total_deliveries' => count($groupedData)
+                ]);
+            }
+            
+            $allGroupedData = $allGrouped ?? $groupedData;
+            $buyerNotifications = $this->getBuyerNotificationCounts($allGroupedData);
+
+            return view('dashboard.exim', compact(
+                'user', 'sapUsername', 'userType', 'groupedData', 'billingData',
+                'documentSettings', 'uploadStatus', 'dataSource', 'loadDuration',
+                'currentPage', 'perPage', 'totalPages', 'totalRecords',
+                'locationStats', 'locationFilter', 'selectedBuyer', 'filteredBuyersByLocation', 'buyerNotifications'
+            ));
+            
+        } catch (\Exception $e) {
+            Log::error('LOGISTIC Dashboard Error: ' . $e->getMessage());
+            
+            return view('dashboard.exim', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Logistic',
+                'groupedData' => [],
+                'billingData' => [],
+                'documentSettings' => [],
+                'uploadStatus' => [],
+                'dataSource' => 'error',
+                'loadDuration' => 0,
+                'currentPage' => 1,
+                'perPage' => 10,
+                'totalPages' => 1,
+                'totalRecords' => 0,
+                'locationStats' => ['surabaya' => 0, 'semarang' => 0],
+                'locationFilter' => 'all',
+                'selectedBuyer' => null,
+                'filteredBuyersByLocation' => [],
+                'buyerNotifications' => [], 
+                'error' => 'System error: ' . $e->getMessage()
+            ]);
+        }
+    }
+    
+    /**
+     * ✅ HELPER: Redirect to correct dashboard based on user type
+     */
+    private function redirectToCorrectDashboard($userType)
+    {
+        $routes = [
+            'admin-finance' => 'dashboard.admin-finance',
+            'exim' => 'dashboard.exim',
+            'logistic' => 'dashboard.logistic',
+            'setting-document' => 'setting-document.dashboard'
+        ];
+        
+        $route = $routes[$userType] ?? 'dashboard.admin-finance';
+        
+        return redirect()->route($route);
+    }
+
+    /**
+     * Apply 40-day billing date filter
+     */
+    private function applyBillingDateFilter($billingData, $daysLimit = 40)
+    {
+        if (!is_array($billingData) || empty($billingData)) {
+            return [];
+        }
+        
+        $cutoffDate = Carbon::now()->subDays($daysLimit);
+        $filteredData = [];
+        $debugInfo = [
+            'total_input' => count($billingData),
+            'cutoff_date' => $cutoffDate->format('Y-m-d'),
+            'filtered_out_count' => 0,
+            'included_count' => 0,
+            'no_date_count' => 0
+        ];
+        
+        foreach ($billingData as $record) {
+            $billingDate = $record['Billing Date'] ?? '';
+            
+            if (empty($billingDate) || trim($billingDate) === '') {
+                $filteredData[] = $record;
+                $debugInfo['no_date_count']++;
+                $debugInfo['included_count']++;
+                continue;
+            }
+            
+            try {
+                if (preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $billingDate)) {
+                    $parsedDate = Carbon::createFromFormat('d.m.Y', $billingDate);
+                    
+                    if ($parsedDate && $parsedDate->gte($cutoffDate)) {
+                        $filteredData[] = $record;
+                        $debugInfo['included_count']++;
+                    } else {
+                        $debugInfo['filtered_out_count']++;
+                    }
+                } else {
+                    $filteredData[] = $record;
+                    $debugInfo['included_count']++;
+                }
+            } catch (\Exception $e) {
+                $filteredData[] = $record;
+                $debugInfo['included_count']++;
+                Log::warning('Date parsing error: ' . $e->getMessage(), [
+                    'billing_date' => $billingDate,
+                    'record' => $record['Delivery'] ?? 'unknown'
+                ]);
+            }
+        }
+        
+        Log::info('BILLING DATE FILTER RESULTS', $debugInfo);
+        
+        return $filteredData;
+    }
+
+   private function groupBillingDataWithStatusFixed($billingData)
+{
+    if (!is_array($billingData)) {
+        Log::warning('groupBillingDataWithStatus received non-array data');
+        return [];
+    }
+    
+    $grouped = [];
+    $processingStats = [
+        'input_records' => count($billingData),
+        'processed_records' => 0,
+        'skipped_records' => 0,
+        'grouped_deliveries' => 0,
+        'multiple_billing_detected' => 0, // ✅ NEW
+        'billing_prefixes_found' => []
+    ];
+    
+    foreach ($billingData as $index => $item) {
+        if (!is_array($item)) {
+            $processingStats['skipped_records']++;
+            continue;
+        }
+        
+        $delivery = $item['Delivery'] ?? '';
+        $customerName = $item['Customer Name'] ?? '';
+        
+        if (empty($delivery)) {
+            $processingStats['skipped_records']++;
+            Log::debug("Skipping record {$index}: No delivery number");
+            continue;
+        }
+        
+        $location = $this->getLocationFromDeliveryOrder($delivery);
+        
+        // ✅ CRITICAL FIX: Gunakan billing_document sebagai bagian dari key
+        // Jika 1 DO punya 2 billing docs berbeda, akan dibuat 2 entry terpisah
+        $sapBillingDocument = $item['Billing Document'] ?? '';
+        $validBillingDocument = null;
+        
+        if (!empty($sapBillingDocument) && 
+            trim($sapBillingDocument) !== '' && 
+            $sapBillingDocument !== $delivery &&
+            $sapBillingDocument !== '0') {
+            $validBillingDocument = trim($sapBillingDocument);
+            
+            $billingPrefix = substr($validBillingDocument, 0, 3);
+            if (!in_array($billingPrefix, $processingStats['billing_prefixes_found'])) {
+                $processingStats['billing_prefixes_found'][] = $billingPrefix;
+            }
+        }
+        
+        // ✅ NEW KEY STRATEGY:
+        // - Jika ada billing doc yang valid -> gunakan sebagai unique key
+        // - Jika tidak ada billing doc -> fallback ke delivery_customer saja
+        if ($validBillingDocument) {
+            $key = $delivery . '_' . $validBillingDocument . '_' . $customerName;
+        } else {
+            $key = $delivery . '_' . $customerName;
+        }
+        
+        $billingDate = $item['Billing Date'] ?? '';
+        $billingDateParsed = null;
+        $billingDateDisplay = '-';
+        
+        if (!empty($billingDate) && preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $billingDate)) {
+            try {
+                $billingDateParsed = Carbon::createFromFormat('d.m.Y', $billingDate);
+                $billingDateDisplay = $billingDateParsed->format('d M Y');
+            } catch (\Exception $e) {
+                Log::debug('Date parsing failed for: ' . $billingDate);
+            }
+        }
+        
+        // ✅ CREATE OR UPDATE GROUP
+        if (!isset($grouped[$key])) {
+            $grouped[$key] = [
+                'delivery' => $delivery,
+                'customer_name' => $customerName,
+                'items' => [],
+                'total_net_value' => 0,
+                'billing_date' => $billingDate,
+                'billing_date_parsed' => $billingDateParsed,
+                'billing_date_display' => $billingDateDisplay,
+                'billing_document' => $validBillingDocument,
+                'booking_number' => trim($item['Booking Number'] ?? '') ?: null,
+                'container_number' => trim($item['Container'] ?? $item['Container Number'] ?? '') ?: null,
+                'currency' => $item['Currency'] ?? 'USD',
+                'item_count' => 0,
+                'status' => 'outstanding',
+                'has_valid_billing' => !empty($validBillingDocument),
+                'location' => $location,
+                'created_at' => $item['Created Date'] ?? Carbon::now()->toDateTimeString(),
+                'updated_at' => Carbon::now()->toDateTimeString(),
+                'billing_documents' => [] // ✅ Array untuk track semua billing docs
+            ];
+            
+            $processingStats['grouped_deliveries']++;
+        }
+        
+        // ✅ SIMPLIFIED: Setiap entry sudah punya key dengan billing_document
+        // Jadi billing_documents array hanya berisi 1 element = billing_document sendiri
+        if (!empty($validBillingDocument)) {
+            // ✅ Set single billing document, bukan accumulate
+            $grouped[$key]['billing_documents'] = [$validBillingDocument];
+            $grouped[$key]['billing_document'] = $validBillingDocument;
+            $grouped[$key]['has_valid_billing'] = true;
+        }
+        
+        // ✅ Add item to group
+        $grouped[$key]['items'][] = $item;
+        $grouped[$key]['item_count']++;
+        
+        // Calculate net value
+        try {
+            $netValueStr = $item['Net Value in Document Currency'] ?? '0';
+            $netValue = floatval(str_replace([',', ' '], '', $netValueStr));
+            $grouped[$key]['total_net_value'] += $netValue;
+        } catch (\Exception $e) {
+            Log::warning('Net value parsing error', [
+                'delivery' => $delivery,
+                'raw_value' => $item['Net Value in Document Currency'] ?? 'null',
+                'error' => $e->getMessage()
+            ]);
+        }
+        
+        $processingStats['processed_records']++;
+    }
+    
+    // ✅ DETECT entries dengan DO yang sama tapi billing berbeda (sibling entries)
+    // Build map of delivery -> all billing docs
+    $deliveryToBillings = [];
+    foreach ($grouped as $key => $group) {
+        $deliveryKey = $group['delivery'] . '_' . $group['customer_name'];
+        if (!isset($deliveryToBillings[$deliveryKey])) {
+            $deliveryToBillings[$deliveryKey] = [];
+        }
+        if (!empty($group['billing_document'])) {
+            $deliveryToBillings[$deliveryKey][$key] = $group['billing_document'];
+        }
+    }
+    
+    // ✅ Mark entries yang punya sibling dengan billing berbeda
+    $multipleCount = 0;
+    foreach ($grouped as $key => &$group) {
+        $deliveryKey = $group['delivery'] . '_' . $group['customer_name'];
+        $allBillingsForDO = $deliveryToBillings[$deliveryKey] ?? [];
+        
+        if (count($allBillingsForDO) > 1) {
+            $multipleCount++;
+            $group['has_multiple_billing_documents'] = true;
+            $group['sibling_billing_docs'] = array_values(array_filter($allBillingsForDO, function($b) use ($group) {
+                return $b !== $group['billing_document'];
+            }));
+            $group['all_billing_docs_for_do'] = array_values($allBillingsForDO);
+            
+            Log::info('✅ DO WITH MULTIPLE BILLING ENTRIES', [
+                'delivery' => $group['delivery'],
+                'this_billing' => $group['billing_document'],
+                'sibling_billings' => $group['sibling_billing_docs'],
+                'customer' => $group['customer_name']
+            ]);
+        } else {
+            $group['has_multiple_billing_documents'] = false;
+            $group['sibling_billing_docs'] = [];
+        }
+    }
+    unset($group);
+    
+    // ✅ ENHANCED LOGGING
+    Log::info('GROUPING RESULTS - BILLING SEPARATION', [
+        'total_records' => $processingStats['input_records'],
+        'grouped_entries' => count($grouped),
+        'entries_with_sibling_billing' => $multipleCount,
+        'billing_prefixes_found' => $processingStats['billing_prefixes_found']
+    ]);
+    
+    // ✅ Update status untuk setiap group
+    foreach ($grouped as $key => &$group) {
+        try {
+            if (class_exists('App\Models\BillingStatus')) {
+                $sapBillingData = [
+                    'Billing Document' => $group['billing_document'],
+                    'Delivery' => $group['delivery'],
+                    'Customer Name' => $group['customer_name'],
+                    'Booking Number' => $group['booking_number']
+                ];
+                
+                $billingStatus = BillingStatus::updateStatus(
+                    $group['delivery'], 
+                    $group['customer_name'], 
+                    null, 
+                    false, 
+                    $sapBillingData
+                );
+                
+                $group['status'] = $billingStatus->status ?? 'outstanding';
+                $group['billing_status_id'] = $billingStatus->id ?? null;
+                
+                $detailedProgress = BillingStatus::getDetailedProgress(
+                    $group['delivery'], 
+                    $group['customer_name']
+                );
+                $group['progress'] = $detailedProgress;
+                $group['can_be_sent'] = $detailedProgress['can_be_sent'] ?? false;
+                $group['next_action'] = $detailedProgress['next_action'] ?? 'Check documents';
+            } else {
+                $group['status'] = !empty($group['billing_document']) ? 'progress' : 'outstanding';
+                $group['progress'] = null;
+                $group['can_be_sent'] = false;
+                $group['next_action'] = 'Manual status check required';
+            }
+            
+        } catch (\Exception $e) {
+            Log::error("Status calculation failed for {$group['delivery']}: " . $e->getMessage());
+            $group['status'] = 'outstanding';
+            $group['progress'] = null;
+            $group['can_be_sent'] = false;
+            $group['next_action'] = 'Error - please check manually';
+        }
+    }
+    
+    return $grouped;
+}
+
+    /**
+     * Count deliveries with booking numbers
+     */
+    private function countWithBookingNumbers($groupedData)
+    {
+        $count = 0;
+        foreach ($groupedData as $group) {
+            if (!empty($group['booking_number'])) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    /**
+     * Count valid billing documents for logging
+     */
+    private function countValidBillingDocuments($groupedData)
+    {
+        $count = 0;
+        foreach ($groupedData as $group) {
+            if ($group['has_valid_billing'] ?? false) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    /**
+     * Get buyer emails with better validation
+     */
+    public function getBuyerEmails($customer_name)
+    {
+        try {
+            Log::info("=== GETTING BUYER EMAILS FOR CUSTOMER ===", [
+                'customer_name' => $customer_name,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+            $emails = DB::table('buyer_emails')
+                ->where('buyer_name', $customer_name)
+                ->orderBy('is_primary', 'desc')
+                ->orderBy('email_type')
+                ->get();
+            
+            if ($emails->isEmpty()) {
+                Log::info('Direct match failed, trying normalized name...');
+                
+                $normalizedName = $this->normalizeCustomerName($customer_name);
+                $emails = DB::table('buyer_emails')
+                    ->where('buyer_name', 'LIKE', "%{$normalizedName}%")
+                    ->orderBy('is_primary', 'desc')
+                    ->orderBy('email_type')
+                    ->get();
+            }
+            
+            if ($emails->isEmpty()) {
+                Log::info('Normalized match failed, trying case-insensitive...');
+                
+                $emails = DB::table('buyer_emails')
+                    ->whereRaw('UPPER(buyer_name) = ?', [strtoupper($customer_name)])
+                    ->orderBy('is_primary', 'desc')
+                    ->orderBy('email_type')
+                    ->get();
+            }
+            
+            if ($emails->isEmpty()) {
+                Log::warning("No emails found for customer: {$customer_name}");
+                
+                $totalEmails = DB::table('buyer_emails')->count();
+                $allCustomers = DB::table('buyer_emails')->distinct()->pluck('buyer_name')->take(10);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No emails found for this buyer',
+                    'emails' => [],
+                    'debug_info' => [
+                        'searched_customer' => $customer_name,
+                        'normalized_customer' => $this->normalizeCustomerName($customer_name),
+                        'total_emails_in_db' => $totalEmails,
+                        'sample_customers' => $allCustomers->toArray()
+                    ]
+                ]);
+            }
+            
+            $validEmails = $emails->filter(function($email) {
+                return !empty($email->email) && !empty($email->id);
+            });
+            
+            if ($validEmails->isEmpty()) {
+                Log::error("Found emails but all are invalid for customer: {$customer_name}");
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Found emails but they contain invalid data',
+                    'emails' => []
+                ]);
+            }
+            
+            $formattedEmails = $validEmails->map(function($email) {
+                return [
+                    'id' => intval($email->id),
+                    'email' => $email->email,
+                    'contact_name' => $email->contact_name,
+                    'email_type' => $email->email_type,
+                    'is_primary' => $email->is_primary,
+                    'buyer_name' => $email->buyer_name,
+                    'display_name' => $this->formatEmailDisplay($email)
+                ];
+            });
+            
+            Log::info("Found and validated " . count($formattedEmails) . " emails for customer: {$customer_name}");
+            
+            return response()->json([
+                'success' => true,
+                'emails' => $formattedEmails,
+                'count' => count($formattedEmails),
+                'customer_name' => $customer_name
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error("Error getting buyer emails for {$customer_name}: " . $e->getMessage());
+            Log::error("Stack trace: " . $e->getTraceAsString());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error loading buyer emails: ' . $e->getMessage(),
+                'emails' => [],
+                'error_code' => 'DATABASE_ERROR'
+            ]);
+        }
+    }
+
+    /**
+     * Get buyer emails with multiple fallback strategies
+     */
+    private function getBuyerEmailsWithFallback($customerName, $selectedEmailIds)
+    {
+        Log::info('=== GETTING BUYER EMAILS WITH FALLBACK ===', [
+            'customer_name' => $customerName,
+            'selected_email_ids' => $selectedEmailIds
+        ]);
+
+        $buyerEmails = DB::table('buyer_emails')
+            ->whereIn('id', $selectedEmailIds)
+            ->where('buyer_name', $customerName)
+            ->get();
+
+        if ($buyerEmails->isNotEmpty()) {
+            Log::info('Strategy 1 SUCCESS: Direct match found', [
+                'found_count' => $buyerEmails->count()
+            ]);
+            return $buyerEmails;
+        }
+
+        Log::info('Strategy 1 FAILED: No direct match, trying normalized name...');
+
+        $normalizedName = $this->normalizeCustomerName($customerName);
+        $buyerEmails = DB::table('buyer_emails')
+            ->whereIn('id', $selectedEmailIds)
+            ->where('buyer_name', $normalizedName)
+            ->get();
+
+        if ($buyerEmails->isNotEmpty()) {
+            Log::info('Strategy 2 SUCCESS: Normalized name match found', [
+                'normalized_name' => $normalizedName,
+                'found_count' => $buyerEmails->count()
+            ]);
+            return $buyerEmails;
+        }
+
+        Log::info('Strategy 2 FAILED: No normalized match, trying case-insensitive...');
+
+        $buyerEmails = DB::table('buyer_emails')
+            ->whereIn('id', $selectedEmailIds)
+            ->whereRaw('UPPER(buyer_name) = ?', [strtoupper($customerName)])
+            ->get();
+
+        if ($buyerEmails->isNotEmpty()) {
+            Log::info('Strategy 3 SUCCESS: Case-insensitive match found', [
+                'found_count' => $buyerEmails->count()
+            ]);
+            return $buyerEmails;
+        }
+
+        Log::info('Strategy 3 FAILED: No case-insensitive match, trying fuzzy match...');
+
+        $buyerEmails = DB::table('buyer_emails')
+            ->whereIn('id', $selectedEmailIds)
+            ->get();
+
+        if ($buyerEmails->isNotEmpty()) {
+            foreach ($buyerEmails as $email) {
+                if ($email->buyer_name !== $customerName) {
+                    Log::warning('Customer name mismatch but email ID found', [
+                        'email_id' => $email->id,
+                        'expected_customer' => $customerName,
+                        'found_customer' => $email->buyer_name,
+                        'email_address' => $email->email
+                    ]);
+                }
+            }
+
+            Log::info('Strategy 4 SUCCESS: Email IDs found (ignoring customer name)', [
+                'found_count' => $buyerEmails->count(),
+                'warning' => 'Customer name may not match exactly'
+            ]);
+            return $buyerEmails;
+        }
+
+        Log::error('ALL STRATEGIES FAILED: No buyer emails found', [
+            'customer_name' => $customerName,
+            'normalized_name' => $normalizedName,
+            'selected_email_ids' => $selectedEmailIds,
+            'total_emails_in_db' => DB::table('buyer_emails')->count(),
+            'emails_for_customer' => DB::table('buyer_emails')->where('buyer_name', $customerName)->count()
+        ]);
+
+        return collect([]);
+    }
+
+    /**
+     * Send to buyer dengan CC system - COMPLETE ERROR HANDLING
+     */
+   public function sendToBuyerMultipleEmails(Request $request)
+{
+    try {
+        try {
+            DB::connection()->getPdo();
+            Log::info('Database connection OK');
+        } catch (\Exception $dbTest) {
+            Log::error('Database connection FAILED', [
+                'error' => $dbTest->getMessage()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Database connection error. Please contact administrator.',
+                'error_code' => 'DB_CONNECTION_ERROR'
+            ], 500);
+        }
+
+        Log::info('=== SEND EMAIL REQUEST START ===', [
+            'delivery_order' => $request->input('delivery_order'),
+            'customer_name' => $request->input('customer_name'),
+            'selected_emails' => $request->input('selected_emails'),
+            'timestamp' => now()->toDateTimeString()
+        ]);
+
+        try {
+            $validated = $request->validate([
+                'delivery_order' => 'required|string',
+                'customer_name' => 'required|string',
+                'selected_emails' => 'required|array|min:1',
+                'selected_emails.*' => 'integer|min:1',
+                'email_message' => 'nullable|string',
+                'notes' => 'nullable|string',
+                'billing_document' => 'nullable|string',
+                'booking_number' => 'nullable|string',
+                'send_as_cc' => 'boolean'
+            ]);
+        } catch (\Illuminate\Validation\ValidationException $valError) {
+            Log::error('VALIDATION ERROR', [
+                'errors' => $valError->errors()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed: ' . implode(', ', array_flatten($valError->errors())),
+                'error_code' => 'VALIDATION_ERROR',
+                'validation_errors' => $valError->errors()
+            ], 422);
+        }
+
+        $deliveryOrder = $validated['delivery_order'];
+        $customerName = $validated['customer_name'];
+        $selectedEmailIds = $validated['selected_emails'];
+        $emailMessage = $validated['email_message'] ?? '';
+        $notes = $validated['notes'] ?? '';
+        $billingDocumentFromFrontend = $validated['billing_document'] ?? null;
+        $bookingNumber = $validated['booking_number'] ?? null;
+        $sendAsCC = $validated['send_as_cc'] ?? true;
+
+        if (empty($selectedEmailIds)) {
+            Log::error('ERROR: No email IDs provided');
+            return response()->json([
+                'success' => false,
+                'message' => 'No email addresses selected. Please select at least one buyer email.',
+                'error_code' => 'NO_EMAILS_SELECTED'
+            ], 400);
+        }
+
+        try {
+            $buyerEmails = $this->getBuyerEmailsWithCCLogic($customerName, $selectedEmailIds);
+        } catch (\Exception $emailError) {
+            Log::error('Error getting buyer emails', [
+                'customer' => $customerName,
+                'error' => $emailError->getMessage()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error loading buyer emails: ' . $emailError->getMessage(),
+                'error_code' => 'EMAIL_LOAD_ERROR'
+            ], 500);
+        }
+        
+        if (!$buyerEmails['primary'] || (is_object($buyerEmails['primary']) && !isset($buyerEmails['primary']->email))) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No primary email found. Please ensure at least one email is marked as primary.',
+                'error_code' => 'NO_PRIMARY_EMAIL'
+            ], 400);
+        }
+
+        try {
+            // ✅ CRITICAL FIX: Pass billing_document parameter
+            $progress = BillingStatus::getDetailedProgress(
+                $deliveryOrder, 
+                $customerName,
+                $billingDocumentFromFrontend  // ✅ ADD THIS LINE
+            );
+            
+            $financeComplete = $progress['finance_complete'] ?? false;
+            $financeProgress = $progress['finance_progress_percentage'] ?? 0;
+            
+            Log::info('📊 Email validation - Finance progress check with billing filter', [
+                'delivery' => $deliveryOrder,
+                'billing_document' => $billingDocumentFromFrontend, // ✅ ADD THIS LINE
+                'finance_complete' => $financeComplete,
+                'finance_progress' => $financeProgress . '%',
+                'finance_uploaded' => $progress['finance_uploaded'] ?? 0,
+                'finance_total' => $progress['finance_total'] ?? 3
+            ]);
+            
+        } catch (\Exception $progError) {
+            Log::error('Progress check failed', [
+                'delivery' => $deliveryOrder,
+                'error' => $progError->getMessage()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot check document progress: ' . $progError->getMessage(),
+                'error_code' => 'PROGRESS_CHECK_ERROR'
+            ], 500);
+        }
+
+        // ✅ UPDATED: Cek Finance completion saja (bukan overall)
+        if (!$financeComplete) {
+            $missingFinanceDocs = array_diff(
+                ['INVOICE', 'PACKING_LIST', 'PAYMENT_INTRUCTION'],
+                $progress['finance_uploaded_documents'] ?? []
+            );
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Finance documents are not complete yet. Please upload all required finance documents first.',
+                'current_progress' => $financeProgress . '%',
+                'missing_documents' => array_values($missingFinanceDocs),
+                'finance_uploaded' => $progress['finance_uploaded'] ?? 0,
+                'finance_total' => $progress['finance_total'] ?? 3,
+                'hint' => 'EXIM documents are not required for sending email from Finance Dashboard'
+            ], 400);
+        }
+
+        try {
+            // ✅ FIXED: Build base query
+            $baseQuery = DocumentUpload::where('delivery_order', $deliveryOrder)
+                                       ->where('customer_name', $customerName);
+
+            // Filter by billing_document jika ada
+            if ($billingDocumentFromFrontend && $billingDocumentFromFrontend !== $deliveryOrder) {
+                $baseQuery->where(function($q) use ($billingDocumentFromFrontend, $deliveryOrder) {
+                    $q->where('billing_document', $billingDocumentFromFrontend)
+                      ->orWhereNull('billing_document')
+                      ->orWhere('billing_document', '')
+                      ->orWhere('billing_document', $deliveryOrder);
+                });
+            }
+
+            // ✅ CRITICAL FIX: Beda logic untuk Finance vs EXIM/Logistic
+            $financeTypes = ['INVOICE', 'PACKING_LIST', 'PAYMENT_INTRUCTION'];
+
+            // Ambil Finance docs (LATEST only - karena auto-upload)
+            $financeDocuments = (clone $baseQuery)
+                ->whereIn('document_type', $financeTypes)
+                ->whereIn('id', function($query) use ($deliveryOrder, $customerName, $financeTypes) {
+                    $query->select(DB::raw('MAX(id)'))
+                        ->from('document_uploads')
+                        ->where('delivery_order', $deliveryOrder)
+                        ->where('customer_name', $customerName)
+                        ->whereIn('document_type', $financeTypes)
+                        ->groupBy('document_type');
+                })
+                ->get();
+
+            // Ambil EXIM/Logistic docs (ALL files - bisa multiple per type)
+            $eximLogisticDocuments = (clone $baseQuery)
+                ->whereNotIn('document_type', $financeTypes)
+                ->orderBy('document_type')
+                ->orderBy('uploaded_at', 'desc')
+                ->get();
+
+            // Gabungkan semua documents
+            $documents = $financeDocuments->merge($eximLogisticDocuments);
+
+            Log::info('Documents retrieved for email', [
+                'delivery_order' => $deliveryOrder,
+                'total_documents' => $documents->count(),
+                'finance_docs' => $financeDocuments->count() . ' (latest per type)',
+                'exim_logistic_docs' => $eximLogisticDocuments->count() . ' (all files)',
+                'document_types' => $documents->groupBy('document_type')->map->count()->toArray()
+            ]);
+
+            if ($documents->isEmpty()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No documents found for this delivery order.',
+                    'error_code' => 'NO_DOCUMENTS'
+                ], 404);
+            }
+            
+        } catch (\Exception $docError) {
+            Log::error('Error loading documents', [
+                'delivery' => $deliveryOrder,
+                'error' => $docError->getMessage()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error loading documents: ' . $docError->getMessage(),
+                'error_code' => 'DOCUMENT_LOAD_ERROR'
+            ], 500);
+        }
+
+        $finalBillingDocument = $billingDocumentFromFrontend ?: $this->getBillingDocumentFromGroupedData($deliveryOrder, $customerName);
+        $finalBookingNumber = $bookingNumber ?: $this->getBookingNumberFromGroupedData($deliveryOrder, $customerName);
+
+        if (!$finalBillingDocument) {
+            $finalBillingDocument = BillingStatus::getBillingDocumentFromSapForEmail($deliveryOrder, $customerName);
+        }
+
+        try {
+            $emailSent = $this->sendCombinedEmailWithCC(
+                $deliveryOrder, 
+                $customerName, 
+                $buyerEmails,
+                $emailMessage, 
+                $notes,
+                $documents,
+                $finalBillingDocument,
+                $finalBookingNumber
+            );
+        } catch (\Exception $emailError) {
+            Log::error('sendCombinedEmailWithCC threw exception', [
+                'delivery' => $deliveryOrder,
+                'error' => $emailError->getMessage(),
+                'trace' => $emailError->getTraceAsString()
+            ]);
+            
+           return response()->json([
+                'success' => false,
+                'message' => 'Email sending failed: ' . $emailError->getMessage(),
+                'error_code' => 'EMAIL_SEND_ERROR'
+            ], 500);
+        }
+        
+        if (!$emailSent) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Email sending failed. Please check mail logs.',
+                'error_code' => 'EMAIL_SEND_FAILED'
+            ], 500);
+        }
+
+        try {
+            $updateData = [
+                'status' => 'sent',
+                'email_sent_at' => now(),
+                'sent_by' => Auth::user()->name ?? 'System',
+                'notes' => $notes,
+                'updated_at' => now()
+            ];
+
+            if ($finalBillingDocument && $finalBillingDocument !== $deliveryOrder) {
+                $updateData['billing_document'] = $finalBillingDocument;
+            }
+
+            BillingStatus::updateOrCreate(
+                [
+                    'delivery_order' => $deliveryOrder,
+                    'customer_name' => $customerName
+                ],
+                $updateData
+            );
+        } catch (\Exception $statusError) {
+            Log::error('Status update failed (non-critical): ' . $statusError->getMessage());
+        }
+
+$displayNumber = $bookingNumber ?: ($finalBillingDocument ?: $deliveryOrder);
+if ($bookingNumber) {
+    $subject = "Booking: {$bookingNumber}";
+    if ($finalBillingDocument && $finalBillingDocument !== $deliveryOrder) {
+        $subject .= " - Doc {$finalBillingDocument}";
+    }
+} else {
+    $subject = "Doc {$displayNumber}";
+}
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Documents sent successfully via CC system to ' . $buyerEmails['total_recipients'] . ' recipients',
+            'email_details' => [
+                'primary_email' => $buyerEmails['primary']->email ?? 'unknown',
+                'cc_count' => count($buyerEmails['cc_emails']),
+                'total_recipients' => $buyerEmails['total_recipients'],
+                'subject' => $subject,
+                'billing_document' => $finalBillingDocument,
+                'booking_number' => $finalBookingNumber
+            ]
+        ]);
+        
+    } catch (\Exception $e) {
+        Log::error('CRITICAL UNEXPECTED ERROR in sendToBuyerMultipleEmails', [
+            'error_message' => $e->getMessage(),
+            'error_file' => $e->getFile(),
+            'error_line' => $e->getLine(),
+            'stack_trace' => $e->getTraceAsString()
+        ]);
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Unexpected server error: ' . $e->getMessage(),
+            'error_code' => 'UNEXPECTED_ERROR',
+            'debug_info' => [
+                'file' => basename($e->getFile()),
+                'line' => $e->getLine(),
+                'type' => get_class($e)
+            ]
+        ], 500);
+    }
+}
+
+    private function getBuyerEmailsWithCCLogic($customerName, $selectedEmailIds)
+    {
+        try {
+            $selectedEmails = $this->getBuyerEmailsWithFallback($customerName, $selectedEmailIds);
+            
+            if ($selectedEmails->isEmpty()) {
+                Log::error('No emails found after fallback', [
+                    'customer' => $customerName,
+                    'selected_ids' => $selectedEmailIds
+                ]);
+                return ['primary' => null, 'cc_emails' => [], 'total_recipients' => 0];
+            }
+
+            $primaryEmail = $selectedEmails->where('is_primary', 1)->first();
+            
+            if (!$primaryEmail && $selectedEmails->isNotEmpty()) {
+                $primaryEmail = $selectedEmails->first();
+                Log::warning('No primary email marked, using first email as primary', [
+                    'email' => $primaryEmail->email ?? 'unknown'
+                ]);
+            }
+            
+            if (!$primaryEmail) {
+                Log::error('No primary email object found', [
+                    'customer' => $customerName,
+                    'selected_count' => $selectedEmails->count()
+                ]);
+                return ['primary' => null, 'cc_emails' => [], 'total_recipients' => 0];
+            }
+
+            if (!isset($primaryEmail->email) || empty($primaryEmail->email)) {
+                Log::error('Primary email object missing email property', [
+                    'customer' => $customerName,
+                    'primary_object' => $primaryEmail,
+                    'object_properties' => get_object_vars($primaryEmail)
+                ]);
+                return ['primary' => null, 'cc_emails' => [], 'total_recipients' => 0];
+            }
+
+            if (!filter_var($primaryEmail->email, FILTER_VALIDATE_EMAIL)) {
+                Log::error('Invalid primary email format', [
+                    'email' => $primaryEmail->email
+                ]);
+                return ['primary' => null, 'cc_emails' => [], 'total_recipients' => 0];
+            }
+
+            $ccEmails = $selectedEmails->filter(function($email) use ($primaryEmail) {
+                return $email->id !== $primaryEmail->id;
+            })->values()->map(function($email) {
+                return [
+                    'id' => $email->id,
+                    'email' => $email->email,
+                    'contact_name' => $email->contact_name,
+                    'email_type' => $email->email_type ?? 'standard',
+                    'is_primary' => $email->is_primary
+                ];
+            })->toArray();
+
+            Log::info('=== CC EMAIL LOGIC SUCCESS ===', [
+                'customer_name' => $customerName,
+                'primary_email' => $primaryEmail->email,
+                'primary_contact' => $primaryEmail->contact_name ?? 'N/A',
+                'primary_type' => gettype($primaryEmail),
+                'primary_is_object' => is_object($primaryEmail),
+                'cc_emails_count' => count($ccEmails),
+                'total_recipients' => $selectedEmails->count()
+            ]);
+
+            return [
+                'primary' => $primaryEmail,
+                'cc_emails' => $ccEmails,
+                'total_recipients' => $selectedEmails->count()
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Error in getBuyerEmailsWithCCLogic', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return ['primary' => null, 'cc_emails' => [], 'total_recipients' => 0];
+        }
+    }
+
+    /**
+     * Kirim email buyer dengan sistem CC (Enhanced Error Handling)
+     */
+    private function sendCombinedEmailWithCC(
+        $deliveryOrder,
+        $customerName,
+        $buyerEmails,
+        $emailMessage,
+        $notes,
+        $documents,
+        $finalBillingDocument,
+        $bookingNumber
+    ) {
+        try {
+            Log::info('=== SEND EMAIL WITH CC - START ===', [
+                'delivery_order' => $deliveryOrder,
+                'customer_name' => $customerName,
+                'buyerEmails_structure' => [
+                    'has_primary' => isset($buyerEmails['primary']),
+                    'primary_type' => isset($buyerEmails['primary']) ? gettype($buyerEmails['primary']) : 'not set',
+                    'primary_is_object' => isset($buyerEmails['primary']) ? is_object($buyerEmails['primary']) : false,
+                    'primary_has_email' => isset($buyerEmails['primary']->email) ? 'yes' : 'no',
+                    'cc_count' => isset($buyerEmails['cc_emails']) ? count($buyerEmails['cc_emails']) : 0
+                ]
+            ]);
+
+            if (!isset($buyerEmails['primary']) || !is_object($buyerEmails['primary'])) {
+                Log::error('Primary email validation FAILED - not an object', [
+                    'buyerEmails' => $buyerEmails
+                ]);
+                throw new \Exception('No primary email found or invalid format');
+            }
+
+            $primaryEmail = $buyerEmails['primary'];
+
+            if (!isset($primaryEmail->email) || empty($primaryEmail->email)) {
+                Log::error('Primary email address is missing', [
+                    'primaryEmail_object' => $primaryEmail,
+                    'object_properties' => get_object_vars($primaryEmail)
+                ]);
+                throw new \Exception('Primary email address is missing');
+            }
+
+            if (!filter_var($primaryEmail->email, FILTER_VALIDATE_EMAIL)) {
+                Log::error('Invalid email format', [
+                    'email' => $primaryEmail->email
+                ]);
+                throw new \Exception('Invalid email format: ' . $primaryEmail->email);
+            }
+
+            Log::info('Email validation passed', [
+                'primary_email' => $primaryEmail->email,
+                'primary_contact' => $primaryEmail->contact_name ?? 'N/A',
+                'cc_count' => count($buyerEmails['cc_emails'])
+            ]);
+
+            $attachments = [];
+            foreach ($documents as $document) {
+                $filePath = storage_path('app/public/' . $document->file_path);
+                if (file_exists($filePath)) {
+                    $attachments[] = [
+                        'path' => $filePath,
+                        'name' => $document->file_name,
+                        'original_name' => $document->document_type . '_' . $document->file_name,
+                        'mime' => $this->getMimeType($document->file_type)
+                    ];
+                    Log::info("Valid attachment: {$document->file_name}");
+                } else {
+                    Log::warning("File not found: {$filePath}");
+                }
+            }
+
+            if (empty($attachments)) {
+                throw new \Exception('No valid attachments found');
+            }
+
+            Log::info("Total attachments prepared: " . count($attachments));
+
+// ✅ UPDATED: Booking number FIRST
+            $displayNumber = $bookingNumber ?: ($finalBillingDocument ?: $deliveryOrder);
+            
+            if ($bookingNumber) {
+                $subject = "Booking: {$bookingNumber}";
+                if ($finalBillingDocument && $finalBillingDocument !== $deliveryOrder) {
+                    $subject .= " - Doc {$finalBillingDocument}";
+                }
+            } else {
+                $subject = "Doc {$displayNumber}";
+            }
+            
+            Log::info("Email subject created", [
+                'subject' => $subject,
+                'billing_document' => $finalBillingDocument,
+                'booking_number' => $bookingNumber
+            ]);
+
+            $emailData = [
+                'delivery_order' => $deliveryOrder,
+                'customer_name' => $customerName,
+                'billing_document' => $finalBillingDocument,
+                'booking_number' => $bookingNumber,
+                'is_billing_email' => $finalBillingDocument && $finalBillingDocument !== $deliveryOrder,
+                'subject' => $subject,
+                'enhanced_subject' => $subject,
+                'display_number' => $displayNumber,
+                'email_message' => $emailMessage ?: $this->generateEnhancedEmailMessage(
+                    $displayNumber,
+                    $customerName,
+                    $primaryEmail->contact_name ?? null,
+                    $finalBillingDocument,
+                    $bookingNumber
+                ),
+                'primary_email' => $primaryEmail->email,
+                'primary_contact_name' => $primaryEmail->contact_name ?? '',
+                'cc_emails' => $buyerEmails['cc_emails'],
+                'total_recipients' => $buyerEmails['total_recipients'],
+                'sent_at' => now()->toDateTimeString(),
+                'sent_by' => Auth::user()->name ?? 'KMI Finance Team',
+                'hide_delivery_display' => true
+            ];
+
+            Log::info('=== EMAIL DATA PREPARED ===', [
+                'subject' => $subject,
+                'display_number' => $displayNumber,
+                'primary_email' => $emailData['primary_email'],
+                'cc_count' => count($emailData['cc_emails']),
+                'total_recipients' => $emailData['total_recipients']
+            ]);
+
+            Log::info('=== CALLING Mail::send() ===');
+            
+            Mail::send('emails.documents-to-buyer', $emailData, function ($message) use ($emailData, $attachments, $subject) {
+                $toEmail = $emailData['primary_email'];
+                $toName = $emailData['primary_contact_name'] ?: '';
+                
+                if (empty($toEmail) || !is_string($toEmail)) {
+                    throw new \Exception('Primary email address is invalid: ' . var_export($toEmail, true));
+                }
+                
+                Log::info('Setting TO address', [
+                    'email' => $toEmail,
+                    'name' => $toName,
+                    'email_type' => gettype($toEmail)
+                ]);
+                
+                $message->to($toEmail, $toName)
+                        ->subject($subject)
+                        ->from('ar.kmi@pawindo.com', 'KMI Finance - Account Receivable');
+
+                foreach ($emailData['cc_emails'] as $ccEmail) {
+                    if (!empty($ccEmail['email']) && filter_var($ccEmail['email'], FILTER_VALIDATE_EMAIL)) {
+                        $message->cc($ccEmail['email'], $ccEmail['contact_name'] ?: '');
+                        Log::info('Added CC', ['email' => $ccEmail['email']]);
+                    } else {
+                        Log::warning('Skipped invalid CC email', ['email' => $ccEmail['email'] ?? 'null']);
+                    }
+                }
+
+                foreach ($attachments as $attachment) {
+                    $message->attach($attachment['path'], [
+                        'as' => $attachment['original_name'],
+                        'mime' => $attachment['mime']
+                    ]);
+                    Log::info('Attached file', ['name' => $attachment['original_name']]);
+                }
+            });
+
+            Log::info("CC Email sent successfully", [
+                'primary' => $emailData['primary_email'],
+                'cc_count' => count($emailData['cc_emails']),
+                'subject' => $subject,
+                'attachments' => count($attachments)
+            ]);
+
+            return true;
+
+        } catch (\Exception $e) {
+            Log::error('CC Email sending failed', [
+                'error' => $e->getMessage(),
+                'error_type' => get_class($e),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+                'primary_data_debug' => isset($buyerEmails['primary']) ? [
+                    'type' => gettype($buyerEmails['primary']),
+                    'is_object' => is_object($buyerEmails['primary']),
+                    'has_email_property' => isset($buyerEmails['primary']->email) ? 'yes' : 'no',
+                    'email_value' => isset($buyerEmails['primary']->email) ? $buyerEmails['primary']->email : 'NO EMAIL PROPERTY',
+                    'object_dump' => var_export($buyerEmails['primary'], true)
+                ] : 'PRIMARY NOT SET'
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Generate enhanced email message with booking info
+     */
+    private function generateEnhancedEmailMessage($displayNumber, $customerName, $contactName, $billingDocument, $bookingNumber)
+    {
+        $greeting = $contactName ? "Dear {$contactName}," : "Dear Buyer,";
+        $isBillingEmail = $billingDocument && $billingDocument !== $displayNumber;
+        
+        $bookingInfo = $bookingNumber ? " (Booking: {$bookingNumber})" : "";
+        
+        if ($isBillingEmail) {
+            return "{$greeting}\n\n" .
+                   "Please find the attached billing documents for {$displayNumber}{$bookingInfo}.\n\n" .
+                   "Please review all documents carefully for payment processing.\n\n" .
+                   "Best Regards,\n" .
+                   "KMI Finance - Account Receivable";
+        } else {
+            return "{$greeting}\n\n" .
+                   "Please find the attached export documents for {$displayNumber}{$bookingInfo}.\n\n" .
+                   "Please review all documents carefully. Billing document will be sent separately once available.\n\n" .
+                   "Best Regards,\n" .
+                   "KMI Finance - Account Receivable";
+        }
+    }
+
+    /**
+     * Get billing document dari grouped data
+     */
+    private function getBillingDocumentFromGroupedData($deliveryOrder, $customerName)
+    {
+        try {
+            if ($this->billingData && is_array($this->billingData)) {
+                foreach ($this->billingData as $record) {
+                    if (($record['Delivery'] ?? '') === $deliveryOrder && 
+                        ($record['Customer Name'] ?? '') === $customerName) {
+                        $billingDoc = $record['Billing Document'] ?? null;
+                        
+                        if ($billingDoc && 
+                            trim($billingDoc) !== '' && 
+                            $billingDoc !== $deliveryOrder &&
+                            $billingDoc !== '0') {
+                            return $billingDoc;
+                        }
+                    }
+                }
+            }
+            
+            Log::info('No billing document found in grouped data', [
+                'delivery_order' => $deliveryOrder,
+                'customer_name' => $customerName
+            ]);
+            
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Error getting billing document from grouped data: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Get booking number from grouped data
+     */
+    private function getBookingNumberFromGroupedData($deliveryOrder, $customerName)
+    {
+        try {
+            if ($this->billingData && is_array($this->billingData)) {
+                foreach ($this->billingData as $record) {
+                    if (($record['Delivery'] ?? '') === $deliveryOrder && 
+                        ($record['Customer Name'] ?? '') === $customerName) {
+                        $bookingNumber = $record['Booking Number'] ?? null;
+                        
+                        if ($bookingNumber && trim($bookingNumber) !== '' && trim($bookingNumber) !== '-') {
+                            return trim($bookingNumber);
+                        }
+                    }
+                }
+            }
+            
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Error getting booking number from grouped data: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Admin Finance Outstanding
+     */
+    public function adminFinanceOutstanding()
+    {
+        try {
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            
+            if ($billingData === null || !is_array($billingData)) {
+                return view('dashboard.outstanding', [
+                    'user' => $user,
+                    'sapUsername' => $sapUsername,
+                    'userType' => 'Admin Finance',
+                    'error' => 'Tidak dapat mengambil data billing.',
+                    'groupedData' => [],
+                    'billingData' => [],
+                    'pageTitle' => 'Outstanding Billing',
+                    'statusFilter' => 'outstanding',
+                    'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+                ]);
+            }
+            
+            $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+     foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+            
+            $outstandingData = collect($allGroupedData)->filter(function ($item) {
+                return in_array(strtolower($item['status']), ['outstanding', 'pending']);
+            })->values()->all();
+            
+            $locationGroups = $this->groupDataByLocation($outstandingData);
+            
+            return view('dashboard.outstanding', [
+                'user' => $user,
+                'sapUsername' => $sapUsername,
+                'userType' => 'Admin Finance',
+                'groupedData' => $outstandingData,
+                'billingData' => $billingData,
+                'pageTitle' => 'Outstanding Billing',
+                'statusFilter' => 'outstanding',
+                'locationGroups' => $locationGroups
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Outstanding Error: ' . $e->getMessage());
+            
+            return view('dashboard.outstanding', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Admin Finance',
+                'error' => 'System error: ' . $e->getMessage(),
+                'groupedData' => [],
+                'billingData' => [],
+                'pageTitle' => 'Outstanding Billing',
+                'statusFilter' => 'outstanding',
+                'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+            ]);
+        }
+    }
+
+    /**
+     * Batch load documents untuk multiple deliveries sekaligus
+     */
+  public function getBatchDocuments(Request $request)
+    {
+        try {
+            $deliveries = $request->get('deliveries', []);
+            
+            if (empty($deliveries)) {
+                return response()->json(['success' => false, 'message' => 'No deliveries provided']);
+            }
+            
+            Log::info('📦 BATCH LOADING DOCUMENTS', [
+                'delivery_count' => count($deliveries),
+                'deliveries' => array_map(function($d) {
+                    return [
+                        'delivery' => $d['delivery_order'] ?? 'N/A',
+                        'billing' => $d['billing_document'] ?? 'N/A',
+                        'customer' => substr($d['customer_name'] ?? '', 0, 20)
+                    ];
+                }, $deliveries)
+            ]);
+            
+            $batchResults = [];
+            $deliveryOrders = array_column($deliveries, 'delivery_order');
+            
+            // Base query
+            $query = DocumentUpload::whereIn('delivery_order', $deliveryOrders)
+                ->select('id', 'delivery_order', 'customer_name', 'billing_document', 'document_type', 
+                         'file_name', 'file_type', 'uploaded_at', 'uploaded_by', 'team');
+            
+            // ✅ CRITICAL: Check if billing_document filtering is needed
+            $hasBillingFilter = false;
+            foreach ($deliveries as $delivery) {
+                if (isset($delivery['billing_document']) && !empty($delivery['billing_document'])) {
+                    $hasBillingFilter = true;
+                    break;
+                }
+            }
+            
+            // ✅ Apply billing filter if needed
+            if ($hasBillingFilter) {
+                Log::info('✅ BILLING FILTER DETECTED');
+                
+                $query->where(function($q) use ($deliveries) {
+                    foreach ($deliveries as $delivery) {
+                        $deliveryOrder = $delivery['delivery_order'];
+                        $billingDocument = $delivery['billing_document'] ?? null;
+                        
+                        if ($billingDocument && $billingDocument !== $deliveryOrder) {
+                            $q->orWhere(function($subQ) use ($deliveryOrder, $billingDocument) {
+                                $subQ->where('delivery_order', $deliveryOrder)
+                                     ->where(function($billQ) use ($billingDocument, $deliveryOrder) {
+                                         $billQ->where('billing_document', $billingDocument)
+                                               ->orWhere('billing_document', $deliveryOrder)
+                                               ->orWhereNull('billing_document');
+                                     });
+                            });
+                        } else {
+                            $q->orWhere('delivery_order', $deliveryOrder);
+                        }
+                    }
+                });
+            }
+            
+            $allDocuments = $query->orderBy('delivery_order')
+                                 ->orderBy('document_type')
+                                 ->orderBy('created_at', 'desc')
+                                 ->get();
+            
+            Log::info('📄 DOCUMENTS LOADED', [
+                'total_documents' => $allDocuments->count()
+            ]);
+            
+            // ✅ Group documents per billing
+            foreach ($deliveries as $delivery) {
+                $deliveryOrder = $delivery['delivery_order'];
+                $customerName = $delivery['customer_name'];
+                $billingDocument = $delivery['billing_document'] ?? null;
+                
+                // Create unique key with billing
+                if ($billingDocument && $billingDocument !== $deliveryOrder) {
+                    $key = $deliveryOrder . '_' . $billingDocument . '_' . $customerName;
+                } else {
+                    $key = $deliveryOrder . '_' . $customerName;
+                }
+                
+                // Filter documents for THIS specific billing
+                $documents = $allDocuments->filter(function($doc) use ($deliveryOrder, $customerName, $billingDocument) {
+                    $matchDelivery = $doc->delivery_order === $deliveryOrder;
+                    $matchCustomer = $doc->customer_name === $customerName;
+                    
+                    // ✅ FILTER BY BILLING DOCUMENT
+                    if ($billingDocument && $billingDocument !== $deliveryOrder) {
+                        $matchBilling = ($doc->billing_document === $billingDocument) ||
+                                      ($doc->billing_document === $deliveryOrder) ||
+                                      (empty($doc->billing_document));
+                        return $matchDelivery && $matchCustomer && $matchBilling;
+                    }
+                    
+                    return $matchDelivery && $matchCustomer;
+                });
+                
+                Log::info('📋 FILTERED DOCUMENTS', [
+                    'delivery' => $deliveryOrder,
+                    'billing' => $billingDocument,
+                    'doc_count' => $documents->count()
+                ]);
+                
+                // Group by document type
+                $groupedByType = [];
+                foreach ($documents as $doc) {
+                    $docType = $doc->document_type;
+                    
+                    if (!isset($groupedByType[$docType])) {
+                        $groupedByType[$docType] = [];
+                    }
+                    
+                    $groupedByType[$docType][] = [
+                        'id' => $doc->id,
+                        'file_name' => $doc->file_name,
+                        'file_type' => $doc->file_type,
+                        'uploaded_by' => $doc->uploaded_by ?? 'System',
+                        'uploaded_at' => $doc->uploaded_at ? $doc->uploaded_at->format('d M Y H:i') : '-',
+                        'billing_document' => $doc->billing_document,
+                        'team' => $doc->team
+                    ];
+                }
+                
+                $batchResults[$key] = $groupedByType;
+            }
+            
+            Log::info('✅ BATCH LOADING COMPLETED', [
+                'processed_deliveries' => count($deliveries),
+                'total_documents' => $allDocuments->count()
+            ]);
+            
+            return response()->json([
+                'success' => true,
+                'documents' => $batchResults,
+                'total_deliveries' => count($deliveries),
+                'total_documents' => $allDocuments->count(),
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('❌ BATCH LOADING FAILED', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to load documents: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Get document counts untuk statistik cepat
+     */
+    public function getDocumentCounts(Request $request)
+    {
+        try {
+            $deliveries = $request->get('deliveries', []);
+            
+            if (empty($deliveries)) {
+                return response()->json(['success' => false, 'message' => 'No deliveries provided']);
+            }
+            
+            $documentCounts = DocumentUpload::whereIn('delivery_order', array_column($deliveries, 'delivery_order'))
+                ->select('delivery_order', 'customer_name', 'document_type', DB::raw('COUNT(*) as count'))
+                ->groupBy('delivery_order', 'customer_name', 'document_type')
+                ->get()
+                ->groupBy(['delivery_order', 'customer_name']);
+            
+            $results = [];
+            foreach ($deliveries as $delivery) {
+                $deliveryOrder = $delivery['delivery_order'];
+                $customerName = $delivery['customer_name'];
+                $key = $deliveryOrder . '_' . $customerName;
+                
+                $counts = $documentCounts->get($deliveryOrder, collect())->get($customerName, collect());
+                
+                $typeCounts = [];
+                foreach ($counts as $count) {
+                    $typeCounts[$count->document_type] = $count->count;
+                }
+                
+                $results[$key] = $typeCounts;
+            }
+            
+            return response()->json([
+                'success' => true,
+                'document_counts' => $results,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Document count loading failed: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to load document counts: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function adminFinanceOnProgress()
+    {
+        try {
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            
+            if ($billingData === null || !is_array($billingData)) {
+                return view('dashboard.onprogres', [
+                    'user' => $user,
+                    'sapUsername' => $sapUsername,
+                    'userType' => 'Admin Finance',
+                    'error' => 'Tidak dapat mengambil data billing.',
+                    'groupedData' => [],
+                    'billingData' => [],
+                    'pageTitle' => 'On Progress',
+                    'statusFilter' => 'onprogress',
+                    'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+                ]);
+            }
+            
+            $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+       foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+            
+            $onProgressData = collect($allGroupedData)->filter(function ($item) {
+                $status = strtolower($item['status'] ?? '');
+                return in_array($status, ['progress', 'onprogress', 'on_progress', 'on-progress', 'processing']);
+            })->values()->all();
+            
+            $locationGroups = $this->groupDataByLocation($onProgressData);
+            
+            return view('dashboard.onprogres', [
+                'user' => $user,
+                'sapUsername' => $sapUsername,
+                'userType' => 'Admin Finance',
+                'groupedData' => $onProgressData,
+                'billingData' => $billingData,
+                'pageTitle' => 'On Progress',
+                'statusFilter' => 'onprogress',
+                'locationGroups' => $locationGroups
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('On Progress Error: ' . $e->getMessage());
+            
+            return view('dashboard.onprogres', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Admin Finance',
+                'error' => 'System error: ' . $e->getMessage(),
+                'groupedData' => [],
+                'billingData' => [],
+                'pageTitle' => 'On Progress',
+                'statusFilter' => 'onprogress',
+                'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+            ]);
+        }
+    }
+
+    public function adminFinanceCompleted()
+    {
+        try {
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            
+            if ($billingData === null || !is_array($billingData)) {
+                return view('dashboard.completed', [
+                    'user' => $user,
+                    'sapUsername' => $sapUsername,
+                    'userType' => 'Admin Finance',
+                    'error' => 'Tidak dapat mengambil data billing.',
+                    'groupedData' => [],
+                    'billingData' => [],
+                    'pageTitle' => 'Completed',
+                    'statusFilter' => 'completed',
+                    'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+                ]);
+            }
+            
+            $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+      foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+            
+            $completedData = collect($allGroupedData)->filter(function ($item) {
+                return in_array(strtolower($item['status']), ['completed', 'done', 'finished']);
+            })->values()->all();
+            
+            $locationGroups = $this->groupDataByLocation($completedData);
+            
+            return view('dashboard.completed', [
+                'user' => $user,
+                'sapUsername' => $sapUsername,
+                'userType' => 'Admin Finance',
+                'groupedData' => $completedData,
+                'billingData' => $billingData,
+                'pageTitle' => 'Completed',
+                'statusFilter' => 'completed',
+                'locationGroups' => $locationGroups
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Completed Error: ' . $e->getMessage());
+            
+            return view('dashboard.completed', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Admin Finance',
+                'error' => 'System error: ' . $e->getMessage(),
+                'groupedData' => [],
+                'billingData' => [],
+                'pageTitle' => 'Completed',
+                'statusFilter' => 'completed',
+                'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+            ]);
+        }
+    }
+
+    public function adminFinanceSent()
+    {
+        try {
+            $user = Auth::user();
+            $sapUsername = session('sap_username');
+            
+            $billingData = $this->getBillingDataWithDatabaseCaching() ?? $this->fetchBillingDataWithFallback();
+            
+            if ($billingData === null || !is_array($billingData)) {
+                return view('dashboard.sent', [
+                    'user' => $user,
+                    'sapUsername' => $sapUsername,
+                    'userType' => 'Admin Finance',
+                    'error' => 'Tidak dapat mengambil data billing.',
+                    'groupedData' => [],
+                    'billingData' => [],
+                    'pageTitle' => 'Sent',
+                    'statusFilter' => 'sent',
+                    'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+                ]);
+            }
+            
+            $allGroupedData = $this->groupBillingDataWithStatusFixed($billingData);
+            
+  foreach ($allGroupedData as $key => $group) {
+    $allGroupedData[$key]['location'] = $this->getLocationFromDeliveryOrder($group['delivery']);
+}
+unset($key, $group);
+            
+            $sentData = collect($allGroupedData)->filter(function ($item) {
+                return in_array(strtolower($item['status']), ['sent', 'delivered', 'transmitted']);
+            })->values()->all();
+            
+            $locationGroups = $this->groupDataByLocation($sentData);
+            
+            return view('dashboard.sent', [
+                'user' => $user,
+                'sapUsername' => $sapUsername,
+                'userType' => 'Admin Finance',
+                'groupedData' => $sentData,
+                'billingData' => $billingData,
+                'pageTitle' => 'Sent',
+                'statusFilter' => 'sent',
+                'locationGroups' => $locationGroups
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Sent Error: ' . $e->getMessage());
+            
+            return view('dashboard.sent', [
+                'user' => Auth::user(),
+                'sapUsername' => session('sap_username'),
+                'userType' => 'Admin Finance',
+                'error' => 'System error: ' . $e->getMessage(),
+                'groupedData' => [],
+                'billingData' => [],
+                'pageTitle' => 'Sent',
+                'statusFilter' => 'sent',
+                'locationGroups' => ['Surabaya' => [], 'Semarang' => [], 'Unknown' => []]
+            ]);
+        }
+    }
+
+    /**
+     * HELPER METHODS
+     */
+    
+    private function calculateStatusFallback($group)
+    {
+        if (!empty($group['billing_document'])) {
+            return 'progress';
+        }
+        return 'outstanding';
+    }
+
+    private function getMimeType($fileExtension)
+    {
+        $mimeTypes = [
+            'pdf' => 'application/pdf',
+            'doc' => 'application/msword',
+            'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'jpg' => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png' => 'image/png',
+            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'xls' => 'application/vnd.ms-excel',
+            'xlsm' => 'application/vnd.ms-excel.sheet.macroEnabled.12'
+        ];
+        return $mimeTypes[strtolower($fileExtension)] ?? 'application/octet-stream';
+    }
+
+    private function normalizeCustomerName($name)
+    {
+        $normalized = str_replace([',', '.', '  '], [' ', ' ', ' '], $name);
+        $suffixes = [
+            'INC.' => 'INC',
+            'Inc.' => 'INC', 
+            'LLC.' => 'LLC',
+            'Corp.' => 'CORP',
+            'Ltd.' => 'LTD',
+            'CO.' => 'CO'
+        ];
+        
+        foreach ($suffixes as $from => $to) {
+            $normalized = str_ireplace($from, $to, $normalized);
+        }
+        
+        return preg_replace('/\s+/', ' ', trim($normalized));
+    }
+
+    private function formatEmailDisplay($email)
+    {
+        $typeLabels = [
+            'primary' => '[PRIMARY]',
+            'secondary' => '[SEC]', 
+            'accounting' => '[ACC]',
+            'logistic' => '[LOG]',
+            'other' => '[OTHER]'
+        ];
+        
+        $label = $typeLabels[$email->email_type] ?? '[STD]';
+        $contact = $email->contact_name ? " ({$email->contact_name})" : '';
+        
+        return "{$email->email}{$contact} - " . ucfirst($email->email_type) . " {$label}";
+    }
+
+    private function fetchBillingDataWithFallback($preferredEndpoint = null): ?array
+    {
+        try {
+            $endpoint = $preferredEndpoint ?? 'fast';
+            
+            if ($endpoint === 'fast') {
+                $response = Http::timeout(30)->get($this->billingApiUrl . '/api/billing_data_fast');
+                
+                if ($response->successful()) {
+                    $responseData = $response->json();
+                    if (isset($responseData['data']) && is_array($responseData['data'])) {
+                        Log::info('Fast billing data fetched successfully', [
+                            'record_count' => count($responseData['data'])
+                        ]);
+                        return $responseData['data'];
+                    }
+                }
+                
+                Log::warning('Fast endpoint failed, trying standard endpoint');
+            }
+            
+            $response = Http::timeout(180)->get($this->billingApiUrl . '/api/billing_data');
+            
+            if ($response->successful()) {
+                $responseData = $response->json();
+                if (isset($responseData['data']) && is_array($responseData['data'])) {
+                    Log::info('Standard billing data fetched successfully', [
+                        'record_count' => count($responseData['data'])
+                    ]);
+                    return $responseData['data'];
+                }
+            }
+        } catch (\Exception $e) {
+            Log::error('Both endpoints failed: ' . $e->getMessage());
+        }
+        
+        return null;
+    }
+
+    private function getFinanceUploadStatus($groupedData)
+    {
+        $financeUploadStatus = [];
+        $financeRequiredDocuments = [
+            'INVOICE', 
+            'PACKING_LIST', 
+            'PAYMENT_INSTRUCTION'
+            
+        ];
+        
+        foreach ($groupedData as $key => $group) {
+            $delivery = $group['delivery'];
+            $customerName = $group['customer_name'];
+            $billingDoc = $group['billing_document'] ?? null; // ✅ Get billing document
+            
+            try {
+                $uploadedDocuments = [];
+                if (class_exists('App\Models\DocumentUpload')) {
+                    // ✅ CRITICAL FIX: Filter by billing_document
+                    $query = DocumentUpload::where('delivery_order', $delivery)
+                                          ->where('customer_name', $customerName)
+                                          ->whereIn('document_type', $financeRequiredDocuments);
+                    
+                    if ($billingDoc && $billingDoc !== $delivery) {
+                        $query->where(function($q) use ($billingDoc, $delivery) {
+                            $q->where('billing_document', $billingDoc)
+                              ->orWhereNull('billing_document')
+                              ->orWhere('billing_document', '')
+                              ->orWhere('billing_document', $delivery);
+                        });
+                    }
+                    
+                    $uploadedDocuments = $query->pluck('document_type')
+                                              ->unique()
+                                              ->toArray();
+                }
+                
+                $totalRequired = count($financeRequiredDocuments);
+                $totalUploaded = count($uploadedDocuments);
+                
+                $financeUploadStatus[$key] = [
+                    'required_documents' => $financeRequiredDocuments,
+                    'uploaded_documents' => $uploadedDocuments,
+                    'total_required' => $totalRequired,
+                    'total_uploaded' => $totalUploaded,
+                    'is_complete' => $totalUploaded >= $totalRequired,
+                    'missing_documents' => array_diff($financeRequiredDocuments, $uploadedDocuments),
+                    'percentage' => $totalRequired > 0 ? round(($totalUploaded / $totalRequired) * 100, 1) : 0
+                ];
+                
+            } catch (\Exception $e) {
+                Log::error('Error getting finance upload status: ' . $e->getMessage());
+                
+                $financeUploadStatus[$key] = [
+                    'required_documents' => $financeRequiredDocuments,
+                    'uploaded_documents' => [],
+                    'total_required' => count($financeRequiredDocuments),
+                    'total_uploaded' => 0,
+                    'is_complete' => false,
+                    'missing_documents' => $financeRequiredDocuments,
+                    'percentage' => 0,
+                    'error' => 'Error loading document status'
+                ];
+            }
+        }
+        
+        return $financeUploadStatus;
+    }
+
+    /**
+     * Get EXIM documents for Finance dashboard dengan real-time integration
+     */
+   private function getEximDocumentsForFinance($groupedData)
+{
+    $eximDocuments = [];
+    
+    // Define Finance document types
+    $financeDocTypes = ['INVOICE', 'PACKING_LIST', 'PAYMENT_INTRUCTION', 'PAYMENT_INSTRUCTION'];
+    
+    foreach ($groupedData as $key => $group) {
+        $delivery = $group['delivery'];
+        $customerName = $group['customer_name'];
+        $billingDoc = $group['billing_document'] ?? null; // ✅ Get billing document
+        
+        try {
+            $newUploadKey = "finance_new_upload_{$delivery}_{$customerName}";
+            $newUploadData = Cache::get($newUploadKey);
+            
+            // ✅ CRITICAL FIX: Filter by billing_document
+            $query = DocumentUpload::where('delivery_order', $delivery)
+                                   ->where('customer_name', $customerName)
+                                   ->orderBy('uploaded_at', 'desc');
+            
+            if ($billingDoc && $billingDoc !== $delivery) {
+                $query->where(function($q) use ($billingDoc, $delivery) {
+                    $q->where('billing_document', $billingDoc)
+                      ->orWhereNull('billing_document')
+                      ->orWhere('billing_document', '')
+                      ->orWhere('billing_document', $delivery);
+                });
+            }
+            
+            $allUploads = $query->get();
+            
+            // Initialize structure
+            $eximDocuments[$key] = [
+                'exim_documents' => [],
+                'finance_documents' => [],
+                'integration_info' => [
+                    'has_new_upload' => $newUploadData ? true : false,
+                    'last_exim_upload' => $allUploads->whereIn('team', ['Exim', 'Logistic'])->max('uploaded_at'),
+                    'new_upload_info' => $newUploadData
+                ]
+            ];
+            
+            // Process each document
+            foreach ($allUploads as $upload) {
+                $normalizedDocType = strtoupper(trim($upload->document_type));
+                
+                $docInfo = [
+                    'id' => $upload->id,
+                    'file_name' => $upload->file_name,
+                    'uploaded_by' => $upload->uploaded_by ?? 'System',
+                    'uploaded_at' => $upload->uploaded_at,
+                    'team' => $upload->team ?? 'Unknown',
+                    'integration_source' => 'EXIM_Dashboard'
+                ];
+                
+                // Check if it's a finance document
+                $isFinanceDoc = in_array($normalizedDocType, $financeDocTypes);
+                
+                if ($isFinanceDoc) {
+                    // Finance document
+                    $eximDocuments[$key]['finance_documents'][$normalizedDocType] = $docInfo;
+                } else {
+                    // EXIM document (including CONTAINER_LOAD)
+                    if (!isset($eximDocuments[$key]['exim_documents'][$normalizedDocType])) {
+                        $eximDocuments[$key]['exim_documents'][$normalizedDocType] = [];
+                    }
+                    $eximDocuments[$key]['exim_documents'][$normalizedDocType][] = $docInfo;
+                }
+            }
+            
+        } catch (\Exception $e) {
+            Log::error('Error getting EXIM documents for Finance: ' . $e->getMessage());
+            $eximDocuments[$key] = [
+                'exim_documents' => [],
+                'finance_documents' => [],
+                'integration_info' => ['error' => $e->getMessage()]
+            ];
+        }
+    }
+    
+    return $eximDocuments;
+}
+
+
+    /**
+     * Helper method to check if document is Finance type
+     */
+    private function isFinanceDocument($documentType)
+    {
+        $financeDocuments = ['INVOICE', 'PACKING_LIST', 'PAYMENT_INTRUCTION'];
+        return in_array($documentType, $financeDocuments);
+    }
+
+    private function getDocumentSettingsForExim($groupedData)
+    {
+        $documentSettings = [];
+        
+        if (!class_exists('App\Models\DocumentSetting')) {
+            return $documentSettings;
+        }
+        
+        $allSettings = DocumentSetting::all();
+        $settingsMap = [];
+        
+        foreach ($allSettings as $setting) {
+            $originalName = $setting->customer_name;
+            $normalizedName = $this->normalizeCustomerName($originalName);
+            
+            $settingsMap[$originalName] = $setting->allowed_documents;
+            $settingsMap[$normalizedName] = $setting->allowed_documents;
+            $settingsMap[strtoupper($originalName)] = $setting->allowed_documents;
+            $settingsMap[strtolower($originalName)] = $setting->allowed_documents;
+            
+            $cleanName = preg_replace('/[^a-zA-Z0-9\s]/', '', $originalName);
+            $settingsMap[$cleanName] = $setting->allowed_documents;
+            $settingsMap[strtoupper($cleanName)] = $setting->allowed_documents;
+        }
+        
+        foreach ($groupedData as $group) {
+            $customerName = $group['customer_name'];
+            $found = false;
+            
+            $variations = [
+                $customerName,
+                $this->normalizeCustomerName($customerName),
+                strtoupper($customerName),
+                strtolower($customerName),
+                trim($customerName),
+                preg_replace('/[^a-zA-Z0-9\s]/', '', $customerName),
+                str_replace(['INC.', 'LLC.', 'CO.'], ['INC', 'LLC', 'CO'], $customerName),
+                str_replace([',', '.'], '', $customerName)
+            ];
+            
+            foreach ($variations as $variation) {
+                if (isset($settingsMap[$variation])) {
+                    $documentSettings[$customerName] = $settingsMap[$variation];
+                    $found = true;
+                    break;
+                }
+            }
+            
+            if (!$found) {
+                $documentSettings[$customerName] = [];
+            }
+        }
+        
+        return $documentSettings;
+    }
+
+    private function getUploadStatus($groupedData)
+    {
+        $uploadStatus = [];
+        
+        foreach ($groupedData as $key => $group) {
+            $delivery = $group['delivery'];
+            $customerName = $group['customer_name'];
+            $billingDoc = $group['billing_document'] ?? null; // ✅ Get billing document
+            
+            try {
+                $documentSetting = $this->findDocumentSettingByCustomerName($customerName);
+                $allowedDocuments = $documentSetting ? $documentSetting->allowed_documents : [];
+                
+                $uploadedDocuments = [];
+                if (class_exists('App\Models\DocumentUpload')) {
+                    // ✅ CRITICAL FIX: Filter by billing_document
+                    $query = DocumentUpload::where('delivery_order', $delivery)
+                                          ->where('customer_name', $customerName);
+                    
+                    if ($billingDoc && $billingDoc !== $delivery) {
+                        $query->where(function($q) use ($billingDoc, $delivery) {
+                            $q->where('billing_document', $billingDoc)
+                              ->orWhereNull('billing_document')
+                              ->orWhere('billing_document', '')
+                              ->orWhere('billing_document', $delivery);
+                        });
+                    }
+                    
+                    $uploadedDocuments = $query->pluck('document_type')
+                                              ->unique()
+                                              ->toArray();
+                }
+                
+                $totalRequired = count($allowedDocuments);
+                $totalUploaded = count($uploadedDocuments);
+                
+                $uploadStatus[$key] = [
+                    'required_documents' => $allowedDocuments,
+                    'uploaded_documents' => $uploadedDocuments,
+                    'total_required' => $totalRequired,
+                    'total_uploaded' => $totalUploaded,
+                    'is_complete' => $totalRequired > 0 && $totalUploaded >= $totalRequired,
+                    'missing_documents' => array_diff($allowedDocuments, $uploadedDocuments),
+                    'percentage' => $totalRequired > 0 ? round(($totalUploaded / $totalRequired) * 100, 1) : 0
+                ];
+                
+            } catch (\Exception $e) {
+                Log::error('Error getting upload status: ' . $e->getMessage());
+                
+                $uploadStatus[$key] = [
+                    'required_documents' => [],
+                    'uploaded_documents' => [],
+                    'total_required' => 0,
+                    'total_uploaded' => 0,
+                    'is_complete' => false,
+                    'missing_documents' => [],
+                    'percentage' => 0,
+                    'error' => 'Error loading document status'
+                ];
+            }
+        }
+        
+        return $uploadStatus;
+    }
+
+    private function findDocumentSettingByCustomerName($customerName)
+    {
+        if (!class_exists('App\Models\DocumentSetting')) {
+            return null;
+        }
+        
+        $setting = DocumentSetting::where('customer_name', $customerName)->first();
+        if ($setting) {
+            return $setting;
+        }
+        
+        $normalizedName = $this->normalizeCustomerName($customerName);
+        $setting = DocumentSetting::where('customer_name', $normalizedName)->first();
+        if ($setting) {
+            return $setting;
+        }
+        
+        $setting = DocumentSetting::whereRaw('UPPER(customer_name) = ?', [strtoupper($customerName)])->first();
+        if ($setting) {
+            return $setting;
+        }
+        
+        $cleanName = preg_replace('/[^a-zA-Z0-9\s]/', '', $customerName);
+        $settings = DocumentSetting::all();
+        foreach ($settings as $setting) {
+            $settingCleanName = preg_replace('/[^a-zA-Z0-9\s]/', '', $setting->customer_name);
+            if (strtoupper($cleanName) === strtoupper($settingCleanName)) {
+                return $setting;
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * ✅ Get document settings specifically for Logistic team
+     */
+    private function getDocumentSettingsForLogistic($groupedData)
+    {
+        $documentSettings = [];
+        
+        foreach ($groupedData as $key => $group) {
+            $delivery = $group['delivery'];
+            $customerName = $group['customer_name'];
+            
+            try {
+                // Get customer's document setting
+                $documentSetting = $this->findDocumentSettingByCustomerName($customerName);
+                
+                if ($documentSetting && !empty($documentSetting->allowed_documents)) {
+                    // ✅ Get ALL logistic documents from DocumentSetting
+                    $allLogisticDocs = DocumentSetting::getDocumentsByTeam('Logistic');
+                    
+                    // ✅ Filter hanya dokumen yang allowed DAN termasuk logistic docs
+                    $allowedLogisticDocs = array_intersect(
+                        $documentSetting->allowed_documents,
+                        $allLogisticDocs
+                    );
+                    
+                    $documentSettings[$key] = array_values($allowedLogisticDocs);
+                } else {
+                    // ✅ Jika tidak ada setting, gunakan semua logistic documents
+                    $documentSettings[$key] = DocumentSetting::getDocumentsByTeam('Logistic');
+                }
+                
+                Log::info('Logistic documents for ' . $customerName, [
+                    'delivery' => $delivery,
+                    'documents' => $documentSettings[$key]
+                ]);
+                
+            } catch (\Exception $e) {
+                Log::error('Error getting logistic document settings: ' . $e->getMessage());
+                // ✅ Fallback ke default logistic documents
+                $documentSettings[$key] = DocumentSetting::getDocumentsByTeam('Logistic');
+            }
+        }
+        
+        return $documentSettings;
+    }
+
+    /**
+     * ✅ Get upload status specifically for Logistic team
+     */
+    private function getUploadStatusForLogistic($groupedData)
+    {
+        $uploadStatus = [];
+        
+        foreach ($groupedData as $key => $group) {
+            $delivery = $group['delivery'];
+            $customerName = $group['customer_name'];
+            $billingDoc = $group['billing_document'] ?? null; // ✅ Get billing document
+            
+            try {
+                $documentSetting = $this->findDocumentSettingByCustomerName($customerName);
+                
+                // ✅ Get allowed logistic documents only
+                $allLogisticDocs = DocumentSetting::getDocumentsByTeam('Logistic');
+                
+                if ($documentSetting && !empty($documentSetting->allowed_documents)) {
+                    $allowedDocuments = array_values(array_intersect(
+                        $documentSetting->allowed_documents,
+                        $allLogisticDocs
+                    ));
+                } else {
+                    $allowedDocuments = $allLogisticDocs;
+                }
+                
+                // ✅ Get uploaded documents (filter by logistic team or uploaded_from)
+                $uploadedDocuments = [];
+                if (class_exists('App\Models\DocumentUpload')) {
+                    // ✅ CRITICAL FIX: Filter by billing_document
+                    $query = DocumentUpload::where('delivery_order', $delivery)
+                        ->where('customer_name', $customerName)
+                        ->where(function($q) {
+                            $q->where('team', 'Logistic')
+                              ->orWhere('uploaded_from', 'logistic');
+                        });
+                    
+                    if ($billingDoc && $billingDoc !== $delivery) {
+                        $query->where(function($q) use ($billingDoc, $delivery) {
+                            $q->where('billing_document', $billingDoc)
+                              ->orWhereNull('billing_document')
+                              ->orWhere('billing_document', '')
+                              ->orWhere('billing_document', $delivery);
+                        });
+                    }
+                    
+                    $uploadedDocuments = $query->pluck('document_type')
+                                              ->unique()
+                                              ->toArray();
+                }
+                
+                $totalRequired = count($allowedDocuments);
+                $totalUploaded = count(array_intersect($uploadedDocuments, $allowedDocuments));
+                
+                $uploadStatus[$key] = [
+                    'required_documents' => $allowedDocuments,
+                    'uploaded_documents' => $uploadedDocuments,
+                    'total_required' => $totalRequired,
+                    'total_uploaded' => $totalUploaded,
+                    'is_complete' => $totalRequired > 0 && $totalUploaded >= $totalRequired,
+                    'missing_documents' => array_diff($allowedDocuments, $uploadedDocuments),
+                    'percentage' => $totalRequired > 0 ? round(($totalUploaded / $totalRequired) * 100, 1) : 0
+                ];
+                
+            } catch (\Exception $e) {
+                Log::error('Error getting logistic upload status: ' . $e->getMessage());
+                
+                $uploadStatus[$key] = [
+                    'required_documents' => [],
+                    'uploaded_documents' => [],
+                    'total_required' => 0,
+                    'total_uploaded' => 0,
+                    'is_complete' => false,
+                    'missing_documents' => [],
+                    'percentage' => 0,
+                    'error' => 'Error loading document status'
+                ];
+            }
+        }
+        
+        return $uploadStatus;
+    }
+
+    /**
+     * API METHODS
+     */
+    
+    public function quickStatus()
+    {
+        try {
+            $startTime = microtime(true);
+            
+            $response = Http::timeout(5)->get($this->billingApiUrl . '/health');
+            
+            $responseTime = microtime(true) - $startTime;
+            
+            if ($response->successful()) {
+                return response()->json([
+                    'status' => 'ok',
+                    'sap_service' => 'connected',
+                    'response_time' => $responseTime,
+                    'timestamp' => now()->toDateTimeString()
+                ]);
+            } else {
+                return response()->json([
+                    'status' => 'error',
+                    'sap_service' => 'disconnected',
+                    'response_time' => $responseTime,
+                    'timestamp' => now()->toDateTimeString()
+                ]);
+            }
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'status' => 'error',
+                'sap_service' => 'disconnected',
+                'error' => $e->getMessage(),
+                'timestamp' => now()->toDateTimeString()
+            ]);
+        }
+    }
+
+    public function testBillingConnection()
+    {
+        $results = [
+            'timestamp' => now()->toDateTimeString(),
+            'tests' => []
+        ];
+        
+        try {
+            $response = Http::timeout(10)->get($this->billingApiUrl . '/health');
+            $results['tests']['health_check'] = [
+                'status' => $response->successful() ? 'OK' : 'FAILED',
+                'response_time' => 'Quick',
+                'details' => $response->successful() ? $response->json() : $response->body()
+            ];
+        } catch (\Exception $e) {
+            $results['tests']['health_check'] = [
+                'status' => 'ERROR',
+                'error' => $e->getMessage()
+            ];
+        }
+        
+        try {
+            $response = Http::timeout(30)->get($this->billingApiUrl . '/api/test_sap_connection');
+            $results['tests']['sap_connection'] = [
+                'status' => $response->successful() ? 'OK' : 'FAILED',
+                'details' => $response->successful() ? $response->json() : $response->body()
+            ];
+        } catch (\Exception $e) {
+            $results['tests']['sap_connection'] = [
+                'status' => 'ERROR',
+                'error' => $e->getMessage()
+            ];
+        }
+        
+        try {
+            $response = Http::timeout(45)->get($this->billingApiUrl . '/api/billing_data_fast');
+            $results['tests']['fast_data'] = [
+                'status' => $response->successful() ? 'OK' : 'FAILED',
+                'record_count' => $response->successful() ? count($response->json()['data'] ?? []) : 0,
+                'details' => $response->successful() ? 'Data retrieved successfully' : $response->body()
+            ];
+        } catch (\Exception $e) {
+            $results['tests']['fast_data'] = [
+                'status' => 'ERROR',
+                'error' => $e->getMessage()
+            ];
+        }
+        
+        try {
+            $storageStats = SapDataStorage::getStorageStats();
+            $results['tests']['database_storage'] = [
+                'status' => 'OK',
+                'details' => $storageStats
+            ];
+        } catch (\Exception $e) {
+            $results['tests']['database_storage'] = [
+                'status' => 'ERROR',
+                'error' => $e->getMessage()
+            ];
+        }
+        
+        return response()->json($results);
+    }
+
+    public function refreshBillingData(Request $request)
+    {
+        try {
+            $forceSync = $request->get('force', false);
+            $endpoint = $request->get('endpoint', 'fast');
+            
+            Log::info('Dashboard refresh requested', [
+                'force' => $forceSync,
+                'endpoint' => $endpoint,
+                'user' => Auth::user()->name ?? 'Unknown'
+            ]);
+            
+            if (!$forceSync) {
+                $cachedData = $this->getBillingDataWithDatabaseCaching();
+                if ($cachedData !== null) {
+                    $groupedData = $this->groupBillingDataWithStatusFixed($cachedData);
+                    
+                    return response()->json([
+                        'status' => 'success',
+                        'data' => $groupedData,
+                        'data_source' => 'database_cache',
+                        'total_records' => count($cachedData),
+                        'grouped_count' => count($groupedData),
+                        'timestamp' => now()->toDateTimeString(),
+                        'cache_age_minutes' => SapDataStorage::getCacheAgeMinutes()
+                    ]);
+                }
+            }
+            
+            $billingData = $this->fetchBillingDataWithFallback($endpoint);
+            
+            if ($billingData !== null && is_array($billingData)) {
+                try {
+                    SapDataStorage::storeBillingData($billingData, $endpoint, 0);
+                    Log::info('Fresh SAP data stored to database');
+                } catch (\Exception $e) {
+                    Log::warning('Failed to store fresh SAP data: ' . $e->getMessage());
+                }
+                
+                $groupedData = $this->groupBillingDataWithStatusFixed($billingData);
+                
+                return response()->json([
+                    'status' => 'success',
+                    'data' => $groupedData,
+                    'data_source' => 'sap_fresh',
+                    'endpoint_used' => $endpoint,
+                    'total_records' => count($billingData),
+                    'grouped_count' => count($groupedData),
+                    'timestamp' => now()->toDateTimeString()
+                ]);
+            }
+            
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unable to fetch billing data from SAP',
+                'timestamp' => now()->toDateTimeString()
+            ], 503);
+            
+        } catch (\Exception $e) {
+            Log::error('Error refreshing billing data: ' . $e->getMessage());
+            
+            return response()->json([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+                'timestamp' => now()->toDateTimeString()
+            ], 500);
+        }
+    }
+
+    /**
+     * DAILY SYNC METHODS
+     */
+    
+    public function getDailySyncInfo()
+    {
+        try {
+            $syncInfo = SapDataStorage::getDailyStorageInfo();
+            
+            return response()->json([
+                'success' => true,
+                'daily_sync_info' => $syncInfo,
+                'timestamp' => now()->toDateTimeString()
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Error getting daily sync info: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Error getting daily sync info: ' . $e->getMessage(),
+                'timestamp' => now()->toDateTimeString()
+            ], 500);
+        }
+    }
+
+    private function getDailySyncStatus()
+    {
+        try {
+            return SapDataStorage::getDailyStorageInfo();
+        } catch (\Exception $e) {
+            Log::error('Error getting daily sync status: ' . $e->getMessage());
+            return [
+                'today_sync_completed' => false,
+                'last_sync_date' => null,
+                'last_sync_time' => null,
+                'cache_age_minutes' => null,
+                'next_scheduled_sync' => 'Unknown',
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    private function triggerEmergencyDailySync()
+    {
+        try {
+            \Illuminate\Support\Facades\Artisan::queue('sap:sync-to-db', [
+                '--force' => true,
+                '--endpoint' => 'fast',
+                '--daily' => true
+            ]);
+            
+            Log::warning('Emergency daily sync dispatched - cache was empty');
+            
+        } catch (\Exception $e) {
+            Log::error('Failed to dispatch emergency daily sync: ' . $e->getMessage());
+        }
+    }
+
+    /**
+ * ✅ NEW: Calculate buyer financial summary dengan currency separation
+ */
+private function calculateBuyerFinancialSummary($groupedData)
+{
+    $buyerFinancialSummary = [];
+    
+    // Group by customer
+    $grouped = collect($groupedData)->groupBy('customer_name');
+    
+    foreach ($grouped as $customerName => $deliveries) {
+        // Initialize totals per currency per location
+        $surabayaTotals = []; // ['USD' => 0, 'IDR' => 0]
+        $semarangTotals = []; // ['USD' => 0, 'IDR' => 0]
+        
+        foreach ($deliveries as $delivery) {
+            $location = $delivery['location'];
+            $currency = $delivery['currency'] ?? 'USD';
+            $netValue = floatval($delivery['total_net_value'] ?? 0);
+            
+            if ($location === 'Surabaya') {
+                if (!isset($surabayaTotals[$currency])) {
+                    $surabayaTotals[$currency] = 0;
+                }
+                $surabayaTotals[$currency] += $netValue;
+                
+            } elseif ($location === 'Semarang') {
+                if (!isset($semarangTotals[$currency])) {
+                    $semarangTotals[$currency] = 0;
+                }
+                $semarangTotals[$currency] += $netValue;
+            }
+        }
+        
+        $buyerFinancialSummary[] = [
+            'name' => $customerName,
+            'slug' => Str::slug($customerName),
+            'surabaya_totals' => $surabayaTotals,  // ✅ Array per currency
+            'semarang_totals' => $semarangTotals,  // ✅ Array per currency
+            'delivery_count' => $deliveries->count(),
+            'all_currencies' => array_unique(array_merge(
+                array_keys($surabayaTotals),
+                array_keys($semarangTotals)
+            ))
+        ];
+    }
+    
+    // Sort by name
+    usort($buyerFinancialSummary, function($a, $b) {
+        return strcmp($a['name'], $b['name']);
+    });
+    
+    return $buyerFinancialSummary;
+}
+
+}
